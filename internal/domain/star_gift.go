@@ -451,6 +451,7 @@ type AdminStarGiftGrantResult struct {
 type StarGiftPurchaseRequest struct {
 	BuyerUserID      int64
 	BuyerPremium     bool
+	BuyerIsBot       bool
 	To               Peer
 	GiftID           int64
 	RevisionID       int64
@@ -1260,6 +1261,8 @@ var (
 	ErrStarGiftFormExpired                 = errors.New("stargift: payment form expired")
 	ErrStarGiftFormPurposeInvalid          = errors.New("stargift: payment form purpose invalid")
 	ErrStarGiftFormAmountMismatch          = errors.New("stargift: payment form amount mismatch")
+	ErrStarGiftNotConvertible              = errors.New("stargift: not convertible")
+	ErrStarGiftIdempotencyConflict         = errors.New("stargift: idempotency conflict")
 )
 
 var ErrStarGiftListed = errors.New("сначала снимите подарок с продажи")
