@@ -1548,6 +1548,8 @@ type fakeBotAPIGateway struct {
 	starGiftUserID           int64
 	starGiftChatID           int64
 	starGiftPayForUpgrade    bool
+	starGiftMessage          domain.PremiumGiftMessage
+	starGiftRequestID        string
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
@@ -1578,6 +1580,8 @@ func (f *fakeBotAPIGateway) BotAPISendStarGift(_ context.Context, botID, giftID,
 	f.starGiftUserID = userID
 	f.starGiftChatID = chatID
 	f.starGiftPayForUpgrade = payForUpgrade
+	f.starGiftMessage = message
+	f.starGiftRequestID = requestID
 	return f.starGiftResult, nil
 }
 
