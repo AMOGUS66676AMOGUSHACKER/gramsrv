@@ -49,6 +49,8 @@ var rules = []rule{
 		allowlist: []string{
 			"docs/premium-stars.md::postgres://user:password@127.0.0.1",
 			"AGENTS.md::postgres://inventory:inventory-test@127.0.0.1",
+			"docs/configuration.en.md::postgres://telesrv:telesrv@127.0.0.1",
+			"docs/configuration.zh-CN.md::postgres://telesrv:telesrv@127.0.0.1",
 		},
 	},
 	{
