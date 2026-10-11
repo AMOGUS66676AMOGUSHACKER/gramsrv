@@ -48,6 +48,8 @@ import type {
   StarGiftListResponse,
   StickerSetListResponse,
   StorageStatsResponse,
+  StatsResponse,
+  GiftAttributesResponse,
   StarsLedgerResponse,
   StarsTopListResponse,
   SharedDeviceGroupListResponse,
@@ -206,6 +208,12 @@ export const api = {
   donationDeposits: (params: URLSearchParams) => request<DonationDepositListResponse>(`/api/donations/deposits?${params.toString()}`),
   itemPrices: () => request<ItemPricesResponse>("/api/item-prices"),
   storageStats: () => request<StorageStatsResponse>("/api/storage/stats"),
+  stats: (days?: number) => {
+    const params = days && days > 0 ? `?days=${days}` : "";
+    return request<StatsResponse>(`/api/stats${params}`);
+  },
+  giftAttributes: (id: string) =>
+    request<GiftAttributesResponse>(`/api/gifts/${encodeURIComponent(id)}/attributes`),
   verificationApplications: (params: URLSearchParams) =>
     request<VerificationApplicationListResponse>(`/api/verification/applications?${params.toString()}`),
   // The application id is an int64 decimal string end to end, so it is never

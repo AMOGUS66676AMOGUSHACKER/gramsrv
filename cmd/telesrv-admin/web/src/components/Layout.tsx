@@ -1,6 +1,7 @@
 import {
   AtSign,
   BadgeCheck,
+  BarChart3,
   Bot,
   ChevronsLeft,
   ChevronsRight,
@@ -76,6 +77,7 @@ export function Shell({
   // what everyone has done (audit.read) deserves an explicit decision, so the
   // entries below are not even visible without the matching right.
   const canManageAdmins = useCan(permissionAdminsManage);
+  const canReadDashboard = useCan(permissionDashboardRead);
   const canReadAudit = useCan(permissionAuditRead);
   const canManageServer = useCan(permissionServerManage);
   const canReadStars = useCan(permissionStarsRead);
@@ -183,6 +185,9 @@ export function Shell({
         <div className="sidebar-label">{t("layout.navigation")}</div>
         <nav className="nav-list" aria-label={t("layout.primaryNav")}>
           <NavLink icon={<LayoutDashboard size={16} />} href="/" route={route} navigate={navigate}>{t("layout.dashboard")}</NavLink>
+          {canReadDashboard && (
+            <NavLink icon={<BarChart3 size={16} />} href="/statistics" route={route} navigate={navigate}>{t("layout.statistics")}</NavLink>
+          )}
           <NavLink icon={<Users size={16} />} href="/accounts" route={route} navigate={navigate}>{t("layout.accounts")}</NavLink>
           <NavLink icon={<Trophy size={16} />} href="/account-ratings" route={route} navigate={navigate}>{t("layout.accountRatings")}</NavLink>
           <NavLink icon={<ShieldCheck size={16} />} href="/channels" route={route} navigate={navigate}>{t("layout.channels")}</NavLink>
@@ -263,6 +268,7 @@ export function Shell({
           {canManageAdmins && (
             <NavLink icon={<UserCog size={16} />} href="/admin-users" route={route} navigate={navigate}>{t("layout.adminUsers")}</NavLink>
           )}
+
           {canManageServer && (
             <NavLink icon={<Settings size={16} />} href="/server-settings" route={route} navigate={navigate}>{t("layout.serverSettings")}</NavLink>
           )}
