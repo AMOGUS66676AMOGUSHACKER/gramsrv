@@ -281,6 +281,7 @@ func (g *CrossCraftGenerator) analyze(ctx context.Context, prompt string, images
 	message := []map[string]any{{"role": "user", "content": content}}
 	if responsesAPI {
 		request["input"] = message
+		request["max_output_tokens"] = 2048
 	} else {
 		request["messages"] = message
 	}
