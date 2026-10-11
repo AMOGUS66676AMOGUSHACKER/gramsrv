@@ -1542,6 +1542,7 @@ type fakeBotAPIGateway struct {
 	premiumGiftMessage       domain.PremiumGiftMessage
 	premiumGiftRequestID     string
 	premiumGiftResult        bool
+	starGiftResult           bool
 }
 
 func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
