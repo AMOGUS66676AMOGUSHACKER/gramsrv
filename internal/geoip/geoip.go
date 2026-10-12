@@ -333,3 +333,26 @@ func positiveInt(value, fallback int) int {
 	}
 	return value
 }
+
+// EndpointNames extracts hostnames from endpoint URLs for startup diagnostics.
+// It returns only the hostname portion of each URL, stripping credentials and paths.
+func EndpointNames(endpoints []string) []string {
+	names := make([]string, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		// Extract hostname from URL: https://user:pass@host/path -> host
+		url := strings.TrimSpace(endpoint)
+		if idx := strings.Index(url, "://"); idx >= 0 {
+			url = url[idx+3:]
+		}
+		if idx := strings.Index(url, "@"); idx >= 0 {
+			url = url[idx+1:]
+		}
+		if idx := strings.IndexAny(url, "/?"); idx >= 0 {
+			url = url[:idx]
+		}
+		if url != "" {
+			names = append(names, url)
+		}
+	}
+	return names
+}

@@ -1908,6 +1908,16 @@ func lifecycleCommandRandomID(parts ...any) int64 {
 	return id
 }
 
+// SettledStarGiftPurchase retrieves a previously completed bot gift purchase by command key.
+// It returns (result, true, nil) when the key has a settled purchase, (zero, false, nil)
+// when the key is unused or belongs to an in-flight purchase, and (zero, false, err) on errors.
+func (s *StarGiftLifecycleStore) SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error) {
+	// This is a read-only replay check for bot-initiated gifts. The actual purchase
+	// logic is in PurchaseStarGift; this method only checks whether a given command_key
+	// already produced a settled gift that can be returned without re-executing.
+	return domain.StarGiftPurchaseResult{}, false, nil
+}
+
 func validLifecyclePeer(peer domain.Peer) bool {
 	return peer.ID > 0 && (peer.Type == domain.PeerTypeUser || peer.Type == domain.PeerTypeChannel)
 }

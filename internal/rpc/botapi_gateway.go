@@ -1181,3 +1181,24 @@ func (r *Router) BotAPIGetFile(ctx context.Context, botID int64, locationKey str
 		Limit:       limit,
 	})
 }
+
+// BotAPIAvailableGifts returns the current star gift catalog for bot purchases.
+func (r *Router) BotAPIAvailableGifts(ctx context.Context) ([]domain.StarGift, error) {
+	if r == nil {
+		return nil, errors.New("STAR_GIFTS_UNAVAILABLE")
+	}
+	// Stub implementation - StarGifts dependency not yet wired in Deps
+	return nil, errors.New("STAR_GIFTS_UNAVAILABLE")
+}
+
+// BotAPISendStarGift purchases and sends one gift out of the bot's Stars balance.
+// userID and chatID are the two mutually exclusive Bot API recipient selectors;
+// the gateway resolves whichever is non-zero into a peer. requestID is the
+// telesrv idempotency key (empty means "charge again").
+func (r *Router) BotAPISendStarGift(ctx context.Context, botID, giftID, userID, chatID int64, payForUpgrade bool, message domain.PremiumGiftMessage, requestID string) (bool, error) {
+	if r == nil {
+		return false, errors.New("STAR_GIFTS_UNAVAILABLE")
+	}
+	// Stub implementation - StarGifts dependency not yet wired in Deps
+	return false, errors.New("STAR_GIFTS_UNAVAILABLE")
+}
