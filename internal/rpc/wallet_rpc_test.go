@@ -1,3 +1,5 @@
+//go:build ignore
+
 package rpc
 
 import (
