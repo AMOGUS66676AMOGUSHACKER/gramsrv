@@ -296,26 +296,10 @@ func (s *StarGiftClaimStore) IsSupportUser(ctx context.Context, userID int64) (b
 // TON transaction. It refuses gifts that already exist on-chain: the real
 // owner there is authoritative and a display-only re-owner would contradict it.
 func (s *StarGiftClaimStore) AdminExportGift(ctx context.Context, req domain.StarGiftAdminExport) (domain.UniqueStarGift, error) {
-	if s == nil || s.db == nil || req.UniqueGiftID <= 0 ||
-		strings.TrimSpace(req.WalletName) == "" || req.ExportedBy <= 0 || req.Date <= 0 {
+	if req.Date <= 0 {
 		return domain.UniqueStarGift{}, domain.ErrStarGiftInvalid
 	}
-	result, err := s.db.Exec(ctx, `UPDATE unique_star_gifts
-SET owner_name=$2,owner_address=$3,owner_peer_type=NULL,owner_peer_id=NULL,
-    host_peer_type='user',host_peer_id=$4,updated_at=now()
-WHERE id=$1 AND gift_address='' AND owner_address='' AND NOT burned`,
-		req.UniqueGiftID, strings.TrimSpace(req.WalletName), strings.TrimSpace(req.WalletAddress), domain.GiftRelayerUserID)
-	if err != nil {
-		return domain.UniqueStarGift{}, fmt.Errorf("admin export star gift to wallet: %w", err)
-	}
-	if result.RowsAffected() != 1 {
-		return domain.UniqueStarGift{}, domain.ErrStarGiftUnavailable
-	}
-	gift, found, err := NewStarGiftStore(s.db).UniqueByID(ctx, req.UniqueGiftID)
-	if err != nil || !found {
-		return domain.UniqueStarGift{}, domain.ErrStarGiftNotFound
-	}
-	return gift, nil
+	return s.WalletBindGift(ctx, domain.StarGiftWalletBind{UniqueGiftID: req.UniqueGiftID, WalletName: req.WalletName, WalletAddress: req.WalletAddress, ActorUserID: req.ExportedBy})
 }
 
 // WHY: the bind is a ledger write, not a TON transfer, so only a gift that
@@ -382,7 +366,7 @@ WHERE unique_gift_id=$1 AND action='bind'
 ORDER BY id DESC LIMIT 1`, giftID).
 				Scan(&ownerType, &ownerID, &currentHostType, &currentHostID)
 			if errors.Is(err, pgx.ErrNoRows) {
-				ownerType, ownerID, currentHostType, currentHostID = "", 0, "user", domain.GiftRelayerUserID
+				return domain.ErrStarGiftUnavailable
 			} else if err != nil {
 				return err
 			}
@@ -391,6 +375,9 @@ ORDER BY id DESC LIMIT 1`, giftID).
 SET owner_name=$2,owner_address=$3,owner_peer_type=NULL,owner_peer_id=NULL,
     host_peer_type=$4,host_peer_id=$5,updated_at=now()
 WHERE id=$1`, giftID, name, address, hostType, hostID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET lifecycle_status='exported' WHERE unique_gift_id=$1`, giftID); err != nil {
 			return err
 		}
 		_, err := tx.Exec(ctx, `INSERT INTO wallet_gift_transfers(
@@ -446,10 +433,7 @@ FROM wallet_gift_transfers
 WHERE unique_gift_id=$1 AND action='bind'
 ORDER BY id DESC LIMIT 1`, uniqueGiftID).Scan(&hostType, &hostID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			if err := tx.QueryRow(ctx, `SELECT COALESCE(host_peer_type,''),COALESCE(host_peer_id,0)
-FROM unique_star_gifts WHERE id=$1`, uniqueGiftID).Scan(&hostType, &hostID); err != nil {
-				return err
-			}
+			return domain.ErrStarGiftUnavailable
 		} else if err != nil {
 			return err
 		}
@@ -461,6 +445,9 @@ SET owner_name='',owner_address='',
     host_peer_id=CASE WHEN $4::text='' THEN NULL ELSE $5::bigint END,
     updated_at=now()
 WHERE id=$1`, uniqueGiftID, ownerType, ownerID, hostType, hostID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET lifecycle_status='active' WHERE unique_gift_id=$1`, uniqueGiftID); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO wallet_gift_transfers(

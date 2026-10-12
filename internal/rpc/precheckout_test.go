@@ -20,7 +20,7 @@ func (c *invoiceChain) sellInvoice(t *testing.T, payload string, amount int64) (
 		t.Fatalf("sendInvoice: %v", err)
 	}
 	payerID := c.newestInvoiceID(t)
-	stored, found, err := c.router.deps.Bots.BotInvoiceByMessage(context.Background(), c.botID, c.botID, payerID)
+	stored, found, err := c.router.deps.Bots.BotInvoiceByMessage(context.Background(), c.botID, c.buyerID, payerID)
 	if err != nil || !found {
 		t.Fatalf("invoice lookup: %v found=%v", err, found)
 	}
@@ -77,8 +77,8 @@ func TestBotInvoicePreCheckoutGate(t *testing.T) {
 		if err := chain.payStarsForm(t, invoice, stored.ID); err != nil {
 			t.Fatalf("approved pre-checkout failed the payment: %v", err)
 		}
-		if chain.gifts.balance != 100 {
-			t.Fatalf("bot wallet = %d, want 100", chain.gifts.balance)
+		if chain.walletBalance(t) != 100 {
+			t.Fatalf("bot wallet = %d, want 100", chain.walletBalance(t))
 		}
 	})
 
@@ -102,8 +102,8 @@ func TestBotInvoicePreCheckoutGate(t *testing.T) {
 		if code.Type != "PAYMENT_FAILED" {
 			t.Fatalf("decline type = %q, want PAYMENT_FAILED", code.Type)
 		}
-		if chain.gifts.balance != 0 {
-			t.Fatalf("bot wallet = %d after a decline, want 0", chain.gifts.balance)
+		if chain.walletBalance(t) != 0 {
+			t.Fatalf("bot wallet = %d after a decline, want 0", chain.walletBalance(t))
 		}
 	})
 
@@ -127,8 +127,8 @@ func TestBotInvoicePreCheckoutGate(t *testing.T) {
 		if elapsed < preCheckoutTimeout {
 			t.Fatalf("gave up after %v, want it to wait the full %v", elapsed, preCheckoutTimeout)
 		}
-		if chain.gifts.balance != 0 {
-			t.Fatalf("bot wallet = %d after a timeout, want 0", chain.gifts.balance)
+		if chain.walletBalance(t) != 0 {
+			t.Fatalf("bot wallet = %d after a timeout, want 0", chain.walletBalance(t))
 		}
 	})
 
@@ -140,8 +140,8 @@ func TestBotInvoicePreCheckoutGate(t *testing.T) {
 		if err == nil {
 			t.Fatal("a bot that does not own the invoice approved the payment")
 		}
-		if chain.gifts.balance != 0 {
-			t.Fatalf("bot wallet = %d, want 0", chain.gifts.balance)
+		if chain.walletBalance(t) != 0 {
+			t.Fatalf("bot wallet = %d, want 0", chain.walletBalance(t))
 		}
 	})
 }
@@ -189,8 +189,8 @@ func TestSettledInvoiceSkipsPreCheckout(t *testing.T) {
 	if err := chain.payStarsForm(t, invoice, stored.ID); err != nil {
 		t.Fatalf("replay: %v", err)
 	}
-	if chain.gifts.balance != 100 {
-		t.Fatalf("bot wallet = %d after a replay, want 100", chain.gifts.balance)
+	if chain.walletBalance(t) != 100 {
+		t.Fatalf("bot wallet = %d after a replay, want 100", chain.walletBalance(t))
 	}
 }
 

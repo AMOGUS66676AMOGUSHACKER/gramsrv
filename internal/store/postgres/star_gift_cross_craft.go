@@ -21,14 +21,8 @@ type crossCraftPreparation struct {
 	model   domain.StarGiftCollectibleAttribute
 }
 
-const (
-	crossCollectionCraftChancePermille = 990
-	// Only the @testing account may craft gifts. Bind access to its stable ID.
-	crossCraftAllowedUserID int64 = 1780243437
-)
-
 func (s *StarGiftLifecycleStore) crossCraftAllowed(ctx context.Context, userID int64) (bool, error) {
-	if userID != crossCraftAllowedUserID {
+	if s == nil || !s.crossCraftUsers[userID] {
 		return false, nil
 	}
 	var allowed bool
@@ -43,7 +37,7 @@ func (s *StarGiftLifecycleStore) CrossCraftCapability(ctx context.Context, userI
 		return false, 0, nil
 	}
 	allowed, err := s.crossCraftAllowed(ctx, userID)
-	return allowed, crossCollectionCraftChancePermille, err
+	return allowed, s.crossCraftChance, err
 }
 
 func (s *StarGiftLifecycleStore) prepareCrossCraft(ctx context.Context, req domain.StarGiftCraftRequest, savedIDs []int64) (crossCraftPreparation, error) {
@@ -65,6 +59,9 @@ func (s *StarGiftLifecycleStore) prepareCrossCraft(ctx context.Context, req doma
 		}
 		prepared.sources = append(prepared.sources, domain.StarGiftCraftSource{UniqueID: unique.ID, GiftID: unique.GiftID, ModelID: unique.Model.ID, ModelName: unique.Model.Name, Backdrop: unique.Backdrop})
 	}
+	if !prepared.mixed {
+		return prepared, nil
+	}
 	allowed, err := s.crossCraftAllowed(ctx, req.UserID)
 	if err != nil {
 		return prepared, err
@@ -72,7 +69,7 @@ func (s *StarGiftLifecycleStore) prepareCrossCraft(ctx context.Context, req doma
 	if !allowed || s.crossCraft == nil || s.crossCraftBlobs == nil || len(savedIDs) < 1 {
 		return prepared, domain.ErrStarGiftCraftUnavailable
 	}
-	prepared.chance = crossCollectionCraftChancePermille
+	prepared.chance = s.crossCraftChance
 	prepared.draw, err = s.craftDraw(1000)
 	if err != nil {
 		return prepared, err

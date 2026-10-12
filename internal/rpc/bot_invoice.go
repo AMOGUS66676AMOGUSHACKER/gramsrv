@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"telesrv/internal/domain"
+	"telesrv/internal/store"
 )
 
 // Bot invoice settlement.
@@ -25,9 +26,8 @@ import (
 // BotAPISendInvoice implements the Bot API sendInvoice method: it stores an
 // invoice message and records the price the server advertised.
 //
-// The invoice is recorded only after the message exists, because its message id
-// is part of the primary key. A caller that retries after a lost response gets
-// a duplicate-send rejection rather than two prices for one sale.
+// The invoice and both message boxes commit together. The invoice key includes
+// the buyer because private message ids are scoped to the buyer's box.
 func (r *Router) BotAPISendInvoice(
 	ctx context.Context,
 	botID, chatID int64,
@@ -84,68 +84,28 @@ func (r *Router) BotAPISendInvoice(
 	if !ok {
 		return domain.Message{}, errors.New("CHAT_ID_INVALID")
 	}
-	var sent domain.Message
-	// The id a payment is keyed by is not always the id the Bot API reports.
-	// Message ids are allocated per user box, not per chat, so the two copies of
-	// a private message get different numbers whenever the participants sit at
-	// different counters - which is the normal case for a bot that has been
-	// running and a buyer who has been active elsewhere. The payer clicks the
-	// button on the copy in their own box and references that number, so the
-	// invoice has to be recorded under it. Channel posts share one id.
-	payableID := 0
-	if peer.Type == domain.PeerTypeChannel {
-		res, err := r.deps.Channels.SendMessage(ctx, botID, domain.SendChannelMessageRequest{
-			UserID: botID, ChannelID: peer.ID, RandomID: randomNonZeroInt64(),
-			Media: media, ReplyMarkup: markup, Date: now,
-		})
-		if err != nil {
-			return domain.Message{}, err
-		}
-		sent = botAPIMessageFromChannel(botID, res.Message)
-		payableID = sent.ID
-	} else {
-		res, err := r.deps.Messages.SendPrivateText(ctx, botID, domain.SendPrivateTextRequest{
-			SenderUserID: botID, RecipientUserID: peer.ID, RandomID: randomNonZeroInt64(),
-			Media: media, ReplyMarkup: markup, Date: now,
-		})
-		if err != nil {
-			return domain.Message{}, err
-		}
-		sent = res.SenderMessage
-		payableID = res.RecipientMessage.ID
+	if peer.Type != domain.PeerTypeUser {
+		return domain.Message{}, errors.New("CHAT_ID_INVALID")
 	}
-	if sent.ID <= 0 || payableID <= 0 {
-		return domain.Message{}, errors.New("MESSAGE_ID_INVALID")
+	payments, ok := r.deps.Bots.(store.BotInvoicePayments)
+	if !ok {
+		return domain.Message{}, notImplementedErr()
 	}
-	// The chat key has to be the peer the client will send back in
-	// inputInvoiceMessage. In a private chat that peer is the bot, not the
-	// buyer's id the Bot API handed us, so storing chat_id verbatim made every
-	// later lookup miss.
-	chatKey := botID
-	if peer.Type == domain.PeerTypeChannel {
-		chatKey = peer.ID
+	recipient, found, err := r.deps.Users.ByID(ctx, botID, peer.ID)
+	if err != nil {
+		return domain.Message{}, err
 	}
-	if _, err := r.deps.Bots.CreateBotInvoice(ctx, domain.BotInvoice{
-		BotUserID: botID, ChatID: chatKey, MessageID: payableID,
-		Title: title, Description: description, Amount: amount,
-		Currency: domain.PremiumCurrencyStars, Payload: payload, Date: now,
-	}); err != nil {
-		// The message is already visible but unpayable. Surfacing the error
-		// keeps the caller from advertising a sale that cannot be settled.
-		return sent, invoiceStoreErr(err)
+	if !found || recipient.Deleted {
+		return domain.Message{}, errors.New("USER_ID_INVALID")
 	}
-	// Logged on the way in so a later lookup miss can be compared against what
-	// was actually recorded, rather than guessed at.
-	if r.log != nil {
-		r.log.Info("bot invoice recorded",
-			zap.Int64("bot_user_id", botID),
-			zap.Int64("chat_key", chatKey),
-			zap.Int("msg_id", payableID),
-			zap.Int("reported_msg_id", sent.ID),
-			zap.Int64("chat_id_param", chatID),
-			zap.Int64("amount", amount),
-		)
+	result, err := payments.CreateBotInvoiceMessage(ctx, domain.BotInvoice{
+		BotUserID: botID, ChatID: peer.ID, Title: title, Description: description, Amount: amount, Currency: domain.PremiumCurrencyStars, Payload: payload, Date: now,
+	}, domain.SendPrivateTextRequest{SenderUserID: botID, RecipientUserID: peer.ID, RandomID: randomNonZeroInt64(), Media: media, ReplyMarkup: markup, Date: now})
+	if err != nil {
+		return domain.Message{}, invoiceStoreErr(err)
 	}
+	sent := result.SenderMessage
+
 	return sent, nil
 }
 
@@ -170,24 +130,13 @@ func (r *Router) botInvoiceForMessage(ctx context.Context, viewerID int64, peer 
 	if err != nil {
 		return domain.BotInvoice{}, err
 	}
-	// The peer is the chat the invoice message lives in, and that is the chat
-	// key CreateBotInvoice stored. A private chat is identified by the bot
-	// itself, so the peer already carries the bot id; a group does not, and the
-	// bot has to be read off the message.
-	chatKey := owner.ID
-	botUserID := owner.ID
 	if owner.Type != domain.PeerTypeUser {
-		chatKey = owner.ID
-		botUserID = 0
-		if r.deps.Messages != nil {
-			if list, err := r.deps.Messages.GetMessages(ctx, viewerID, []int{msgID}); err == nil && list.Count == 1 && len(list.Messages) == 1 {
-				botUserID = list.Messages[0].From.ID
-			}
-		}
-		if botUserID <= 0 {
-			return domain.BotInvoice{}, errBotInvoiceNotFound
-		}
+		return domain.BotInvoice{}, errBotInvoiceNotFound
 	}
+	// Private message identifiers are scoped to the buyer's box, not the bot's.
+	chatKey := viewerID
+	botUserID := owner.ID
+
 	invoice, found, err := r.deps.Bots.BotInvoiceByMessage(ctx, botUserID, chatKey, msgID)
 	if err != nil {
 		return domain.BotInvoice{}, err

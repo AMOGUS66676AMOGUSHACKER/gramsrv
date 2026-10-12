@@ -43,10 +43,8 @@ func (s *offlineViewerUsers) ByID(_ context.Context, _, userID int64) (domain.Us
 	return domain.User{ID: userID, Deleted: true, DeletedAt: 1_800_000_000}, true, nil
 }
 
-// The durable queue is what makes a tombstone converge for viewers who were
-// offline when the deletion committed: they get updateUser plus the display name
-// they would otherwise never learn about.
-func TestAccountDeletionNotificationsDispatchToOfflineViewer(t *testing.T) {
+// An online refresh includes the complete tombstone projection.
+func TestAccountDeletionNotificationsDispatchToOnlineViewer(t *testing.T) {
 	const (
 		targetUserID  = int64(5005)
 		deletedUserID = int64(6006)
@@ -113,5 +111,14 @@ func TestAccountDeletionNotificationsDrainStopsOnEmptyQueue(t *testing.T) {
 
 	if notifications.claimCalls != 1 {
 		t.Fatalf("claim calls = %d, want exactly one for an empty queue", notifications.claimCalls)
+	}
+}
+
+func TestAccountDeletionNotificationsRetainOfflineHint(t *testing.T) {
+	notifications := &fakeDeletionNotifications{}
+	r := New(Config{}, Deps{Users: &offlineViewerUsers{}}, zaptest.NewLogger(t), clock.System)
+	r.dispatchAccountDeletionNotification(context.Background(), notifications, domain.AccountDeletionNotification{ID: 1, TargetUserID: 5005, DeletedUserID: 6006})
+	if len(notifications.completed) != 0 {
+		t.Fatal("offline delivery was completed")
 	}
 }

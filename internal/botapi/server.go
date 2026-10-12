@@ -306,6 +306,10 @@ func (h *handler) handle(w http.ResponseWriter, r *http.Request) {
 		h.answerWebAppQuery(w, r, botID)
 	case "savepreparedinlinemessage":
 		h.savePreparedInlineMessage(w, r, botID)
+	case "getavailablegifts":
+		h.getAvailableGifts(w, r)
+	case "sendgift":
+		h.sendGift(w, r, botID)
 	case "giftpremiumsubscription":
 		h.giftPremiumSubscription(w, r, botID)
 	case "sendinvoice":
@@ -391,6 +395,110 @@ func (h *handler) giftPremiumSubscription(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeAPIOK(w, success)
+}
+
+// sendGift 实现 Bot API sendGift：机器人用自身 Stars 余额买一份星礼物送给用户或频道。
+//
+// 参数遵循官方 Bot API 形态：gift_id 必填，user_id 与 chat_id 二选一（互斥），
+// pay_for_upgrade 购买 collectible 升级，text/text_parse_mode/text_entities 是随礼物
+// 显示的短文本。request_id 与 Idempotency-Key 头是 telesrv 的幂等扩展，语义与
+// giftPremiumSubscription 相同：同键同请求返回 true 且不再扣款，同键不同请求报错。
+func (h *handler) sendGift(w http.ResponseWriter, r *http.Request, botID int64) {
+	gateway, ok := h.gateway.(StarGiftGatewayService)
+	if !ok {
+		writeAPIError(w, http.StatusNotImplemented, "METHOD_NOT_FOUND")
+		return
+	}
+	values, err := requestValues(r)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST")
+		return
+	}
+	giftID, err := strconv.ParseInt(strings.TrimSpace(values["gift_id"]), 10, 64)
+	if err != nil || giftID <= 0 {
+		writeAPIError(w, http.StatusBadRequest, "GIFT_ID_INVALID")
+		return
+	}
+	userID, userErr := botAPIOptionalInt64(values["user_id"])
+	chatID, chatErr := botAPIOptionalInt64(values["chat_id"])
+	// 两者都没给或都给都不是合法请求：官方模型里它们互斥，缺失时无法决定收礼人。
+	if userErr != nil || chatErr != nil ||
+		(userID == 0 && chatID == 0) || (userID != 0 && chatID != 0) {
+		writeAPIError(w, http.StatusBadRequest, "CHAT_ID_INVALID")
+		return
+	}
+	text, entities, err := botAPIFormattedTextRaw(
+		values["text"], values["text_parse_mode"], values["text_entities"],
+		domain.MaxPremiumGiftMessageRunes, false,
+	)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !premiumGiftBotAPIEntitiesAllowed(entities) {
+		writeAPIError(w, http.StatusBadRequest, "ENTITY_TYPE_UNSUPPORTED")
+		return
+	}
+	requestID, err := botAPIRequestID(r, values)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	success, err := gateway.BotAPISendStarGift(
+		r.Context(),
+		botID,
+		giftID,
+		userID,
+		chatID,
+		apiBool(values["pay_for_upgrade"]),
+		domain.PremiumGiftMessage{Text: text, Entities: entities},
+		requestID,
+	)
+	if err != nil {
+		// STAR_GIFT_UNAVAILABLE 表示礼物子系统自己不可用（каталог/журнал не отвечают），
+		// а не запрос неверен: 500, иначе бот решит, что ошибся его вызов.
+		if description := apiErrorDescription(err); description == "STAR_GIFT_UNAVAILABLE" {
+			writeAPIError(w, http.StatusInternalServerError, description)
+			return
+		} else {
+			writeAPIError(w, http.StatusBadRequest, description)
+			return
+		}
+	}
+	writeAPIOK(w, success)
+}
+
+// botAPIOptionalInt64 解析可选整数字段：空值表示「未提供」，非法内容是错误。
+func botAPIOptionalInt64(raw string) (int64, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, nil
+	}
+	value, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+// botAPIRequestID 归一化幂等键：本地 request_id 与 Idempotency-Key 头同时出现时必须
+// 一致，缺失时生成随机键——无键的重试会再次扣款，所以宁可给每个调用一个唯一键。
+func botAPIRequestID(r *http.Request, values map[string]string) (string, error) {
+	requestID := strings.TrimSpace(values["request_id"])
+	headerID := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if requestID != "" && headerID != "" && requestID != headerID {
+		return "", errors.New("IDEMPOTENCY_KEY_INVALID")
+	}
+	if requestID == "" {
+		requestID = headerID
+	}
+	if requestID == "" {
+		requestID = randomBotAPIOwner()
+	}
+	if !validBotAPIIdempotencyKey(requestID) {
+		return "", errors.New("IDEMPOTENCY_KEY_INVALID")
+	}
+	return requestID, nil
 }
 
 func premiumGiftBotAPIEntitiesAllowed(entities []domain.MessageEntity) bool {
@@ -1663,6 +1771,9 @@ func apiErrorDescription(err error) string {
 		"WEBHOOK_NOT_IMPLEMENTED",
 		"MONTH_COUNT_INVALID",
 		"STAR_COUNT_INVALID",
+		"GIFT_NOT_AVAILABLE",
+		"GIFT_UPGRADE_UNAVAILABLE",
+		"STAR_GIFT_UNAVAILABLE",
 		"IDEMPOTENCY_KEY_INVALID",
 		"BALANCE_TOO_LOW",
 		"PREMIUM_GIFT_SELF_INVALID",

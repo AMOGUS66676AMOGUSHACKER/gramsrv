@@ -10,12 +10,8 @@ import (
 	"telesrv/internal/domain"
 )
 
-// RunAccountDeletionNotifications drains the durable tombstone queue.
-//
-// Deletion is irreversible and viewer-visible, so the refresh cannot depend on
-// who happened to be online: every contact and dialog peer gets their own row and
-// is served when their push lands, which is what makes a deleted account read as
-// deleted instead of keeping a live composer.
+// RunAccountDeletionNotifications retries non-PTS refresh hints. Authoritative
+// tombstone reads provide offline convergence; enqueueing a hint is not a client ACK.
 func (r *Router) RunAccountDeletionNotifications(ctx context.Context, interval time.Duration, batch int) {
 	if interval <= 0 {
 		interval = time.Minute
@@ -106,7 +102,7 @@ func (r *Router) dispatchAccountDeletionNotification(ctx context.Context, svc Ac
 	// updateUser alone refreshes only the photo on several clients, so the display
 	// name travels in updateUserName next to it. Without that pair the viewer
 	// keeps a live composer against an account that no longer exists.
-	r.pushUserUpdates(pushCtx, notification.TargetUserID, &tg.Updates{
+	sent := r.pushUserUpdates(pushCtx, notification.TargetUserID, &tg.Updates{
 		Updates: []tg.UpdateClass{
 			&tg.UpdateUser{UserID: notification.DeletedUserID},
 			&tg.UpdateUserName{
@@ -126,6 +122,9 @@ func (r *Router) dispatchAccountDeletionNotification(ctx context.Context, svc Ac
 		Date:  int(r.clock.Now().Unix()),
 	})
 	pushCancel()
+	if sent == 0 {
+		return
+	} // Keep the lease retryable while every session is offline.
 
 	completeCtx, completeCancel := context.WithTimeout(ctx, 10*time.Second)
 	if err := svc.CompleteAccountDeletionNotification(completeCtx, notification.ID, r.clock.Now().UTC()); err != nil {

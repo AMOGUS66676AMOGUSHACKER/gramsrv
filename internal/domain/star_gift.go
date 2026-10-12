@@ -242,6 +242,7 @@ type UniqueStarGift struct {
 	OriginalMessage         string
 	OriginalMessageEntities []MessageEntity
 	OriginalNameHidden      bool
+	Unsaved                 bool // true when the source saved gift is hidden from the owner's profile
 	CreatedAt               time.Time
 }
 
@@ -1164,6 +1165,7 @@ type SavedStarGiftPage struct {
 // order: pinned gifts first by PinnedOrder, then unpinned gifts by ID DESC.
 // PinnedOrder == 0 identifies the unpinned segment.
 type SavedStarGiftListCursor struct {
+	Date        int
 	PinnedOrder int
 	ID          int64
 }
@@ -1494,11 +1496,11 @@ func StarGiftCollectionHash(title string, giftIDs []int64) int64 {
 // EncodeSavedStarGiftListCursor encodes the exact profile-order key of the last
 // visible gift. The version prefix keeps this cursor distinct from other star
 // gift lists that are ordered only by instance ID.
-func EncodeSavedStarGiftListCursor(pinnedOrder int, id int64) string {
-	if pinnedOrder < 0 || id <= 0 {
+func EncodeSavedStarGiftListCursor(pinnedOrder, date int, id int64) string {
+	if pinnedOrder < 0 || date < 0 || id <= 0 {
 		return ""
 	}
-	raw := "v1:" + strconv.Itoa(pinnedOrder) + ":" + strconv.FormatInt(id, 10)
+	raw := "v2:" + strconv.Itoa(pinnedOrder) + ":" + strconv.Itoa(date) + ":" + strconv.FormatInt(id, 10)
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
@@ -1513,18 +1515,22 @@ func DecodeSavedStarGiftListCursor(s string) (SavedStarGiftListCursor, bool) {
 		return SavedStarGiftListCursor{}, false
 	}
 	parts := strings.Split(string(raw), ":")
-	if len(parts) != 3 || parts[0] != "v1" {
+	if len(parts) != 4 || parts[0] != "v2" {
 		return SavedStarGiftListCursor{}, false
 	}
 	order, err := strconv.ParseInt(parts[1], 10, 32)
 	if err != nil || order < 0 {
 		return SavedStarGiftListCursor{}, false
 	}
-	id, err := strconv.ParseInt(parts[2], 10, 64)
+	date, err := strconv.ParseInt(parts[2], 10, 32)
+	if err != nil || date < 0 {
+		return SavedStarGiftListCursor{}, false
+	}
+	id, err := strconv.ParseInt(parts[3], 10, 64)
 	if err != nil || id <= 0 {
 		return SavedStarGiftListCursor{}, false
 	}
-	return SavedStarGiftListCursor{PinnedOrder: int(order), ID: id}, true
+	return SavedStarGiftListCursor{PinnedOrder: int(order), Date: int(date), ID: id}, true
 }
 
 // EncodeSavedStarGiftPriceCursor 编码 sort_by_value 排序的 keyset 游标

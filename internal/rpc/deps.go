@@ -380,10 +380,9 @@ type BotsService interface {
 	// resolved from the invoice instead of the request.
 	CreateBotInvoice(ctx context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error)
 	BotInvoiceByMessage(ctx context.Context, botUserID, chatID int64, messageID int) (domain.BotInvoice, bool, error)
-	SettleBotInvoice(ctx context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error)
+
 	BotInvoiceByCharge(ctx context.Context, chargeID string) (domain.BotInvoice, bool, error)
-	MarkBotInvoiceRefunded(ctx context.Context, chargeID string) (bool, error)
-	ReleaseBotInvoiceRefund(ctx context.Context, chargeID string) error
+
 	PutWebViewCustomMethodQuery(ctx context.Context, botUserID, userID int64, method, paramsJSON string) (domain.BotWebViewCustomMethodQuery, error)
 }
 
@@ -1233,6 +1232,7 @@ type PasskeyService interface {
 // GiftsService 抽象 Star 礼物（app/stargifts）：目录 + peer 收到的礼物实例 CRUD。
 // 扣费/退款/服务消息投递由 rpc 层经 Stars 账本 + Messages.SendPrivateText 编排。
 type GiftsService interface {
+	SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error)
 	Catalog(ctx context.Context) ([]domain.StarGift, error)
 	CatalogHash(ctx context.Context) (int, error)
 	GiftByID(ctx context.Context, id int64) (domain.StarGift, bool, error)

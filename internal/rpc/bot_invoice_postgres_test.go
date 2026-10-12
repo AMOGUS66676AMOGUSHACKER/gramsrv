@@ -14,22 +14,12 @@ import (
 
 	appbots "telesrv/internal/app/bots"
 	appmessages "telesrv/internal/app/messages"
+	appgifts "telesrv/internal/app/stargifts"
 	appstars "telesrv/internal/app/stars"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
 	"telesrv/internal/store/postgres"
 )
-
-// pgInvoiceGifts credits the bot wallet like the production service does.
-type pgInvoiceGifts struct {
-	GiftsService
-	balance int64
-}
-
-func (g *pgInvoiceGifts) CreditBotStarsWallet(_ context.Context, credit domain.BotStarsCredit) (int64, bool, error) {
-	g.balance += credit.Amount
-	return g.balance, true, nil
-}
 
 // The memory store hands out one message id per participant box per send, and
 // that keeps the two boxes in lockstep. Postgres is the backend that runs in
@@ -76,13 +66,13 @@ func TestBotInvoiceChainPostgres(t *testing.T) {
 
 	messages := appmessages.NewService(msgStore, dialogs)
 	stars := appstars.NewService(postgres.NewStarsStore(pool), appstars.WithStartingGrant(5000))
-	gifts := &pgInvoiceGifts{}
+	gifts := postgres.NewStarGiftLifecycleStore(pool, msgStore, 0)
 	r := New(Config{}, Deps{
 		Users:         appusers.NewService(users),
 		Bots:          bots,
 		Messages:      messages,
 		Stars:         stars,
-		Gifts:         gifts,
+		Gifts:         appgifts.NewService(postgres.NewStarGiftStore(pool), nil, 2, appgifts.WithLifecycleStore(gifts)),
 		BotAPIUpdates: postgres.NewBotAPIUpdateStore(pool),
 	}, zaptest.NewLogger(t), clock.System)
 
@@ -113,7 +103,7 @@ func TestBotInvoiceChainPostgres(t *testing.T) {
 	payerID := pgBuyerInvoiceID(t, msgStore, buyer.ID)
 	t.Logf("bot reported message_id=%d, payer box id=%d", msg.ID, payerID)
 
-	stored, found, err := r.deps.Bots.BotInvoiceByMessage(ctx, bot.ID, bot.ID, payerID)
+	stored, found, err := r.deps.Bots.BotInvoiceByMessage(ctx, bot.ID, buyer.ID, payerID)
 	if err != nil || !found {
 		t.Fatalf("invoice under payer id %d: err=%v found=%v, want found", payerID, err, found)
 	}
@@ -174,8 +164,12 @@ func TestBotInvoiceChainPostgres(t *testing.T) {
 	if after.Balance != before.Balance-100 {
 		t.Fatalf("payer balance = %d, want %d", after.Balance, before.Balance-100)
 	}
-	if gifts.balance != 100 {
-		t.Fatalf("bot wallet = %d, want 100", gifts.balance)
+	wallet, err := gifts.BotStarsBalance(ctx, bot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wallet != 100 {
+		t.Fatalf("bot wallet = %d, want 100", wallet)
 	}
 }
 

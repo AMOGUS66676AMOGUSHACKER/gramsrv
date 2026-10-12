@@ -1478,7 +1478,11 @@ func (f *fakeWebAppService) SavePreparedInlineMessageFromBotAPI(_ context.Contex
 }
 
 type fakeBotAPIGateway struct {
-	self domain.User
+	availableGifts    []domain.StarGift
+	availableGiftsErr error
+	starGiftCalled    bool
+	starGiftErr       error
+	self              domain.User
 
 	updates      []domain.UpdateEvent
 	updateBotID  int64
@@ -1571,10 +1575,11 @@ func (f *fakeBotAPIGateway) BotAPIGiftPremiumSubscription(
 }
 
 func (f *fakeBotAPIGateway) BotAPIAvailableGifts(context.Context) ([]domain.StarGift, error) {
-	return nil, nil
+	return f.availableGifts, f.availableGiftsErr
 }
 
 func (f *fakeBotAPIGateway) BotAPISendStarGift(_ context.Context, botID, giftID, userID, chatID int64, payForUpgrade bool, message domain.PremiumGiftMessage, requestID string) (bool, error) {
+	f.starGiftCalled = true
 	f.starGiftBotID = botID
 	f.starGiftID = giftID
 	f.starGiftUserID = userID
@@ -1582,7 +1587,7 @@ func (f *fakeBotAPIGateway) BotAPISendStarGift(_ context.Context, botID, giftID,
 	f.starGiftPayForUpgrade = payForUpgrade
 	f.starGiftMessage = message
 	f.starGiftRequestID = requestID
-	return f.starGiftResult, nil
+	return f.starGiftResult, f.starGiftErr
 }
 
 func (f *fakeBotAPIGateway) BotAPISelf(context.Context, int64) (domain.User, error) {

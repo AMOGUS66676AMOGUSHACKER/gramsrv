@@ -2,43 +2,36 @@ package rpc
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/iamxvbaba/td/bin"
 	"github.com/iamxvbaba/td/clock"
 	"github.com/iamxvbaba/td/tg"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap/zaptest"
 
 	appbots "telesrv/internal/app/bots"
 	appmessages "telesrv/internal/app/messages"
+	appgifts "telesrv/internal/app/stargifts"
 	appstars "telesrv/internal/app/stars"
 	appusers "telesrv/internal/app/users"
 	"telesrv/internal/domain"
-	"telesrv/internal/store/memory"
+	"telesrv/internal/store/postgres"
 )
 
-// invoiceGifts credits the bot wallet like the production service does.
-type invoiceGifts struct {
-	GiftsService
-	balance int64
-	credits []domain.BotStarsCredit
-}
-
-func (g *invoiceGifts) CreditBotStarsWallet(_ context.Context, credit domain.BotStarsCredit) (int64, bool, error) {
-	g.credits = append(g.credits, credit)
-	g.balance += credit.Amount
-	return g.balance, true, nil
-}
-
 type invoiceChain struct {
+	pool   *pgxpool.Pool
 	router *Router
-	store  *memory.MessageStore
+	store  *postgres.MessageStore
 	stars  *appstars.Service
-	gifts  *invoiceGifts
+	gifts  *postgres.StarGiftLifecycleStore
 	// updates is the Bot API queue: storing a message in the bot's chat is not
 	// delivery. The successful_payment assertion below reads it, which is the only
 	// thing that stands between "the message exists" and "getUpdates shows it".
-	updates *memory.BotAPIUpdateStore
+	updates *postgres.BotAPIUpdateStore
 	botID   int64
 	// otherBotID is a second real bot. Ownership tests need a genuine second
 	// bot: an arbitrary unused id would be refused by callerBotID as USER_BOT_REQUIRED
@@ -50,17 +43,30 @@ type invoiceChain struct {
 func newInvoiceChain(t *testing.T) *invoiceChain {
 	t.Helper()
 	ctx := context.Background()
-	users := memory.NewUserStore()
-	botStore := memory.NewBotStore(users)
-	dialogs := memory.NewDialogStore()
-	msgStore := memory.NewMessageStore(dialogs)
+	dsn := os.Getenv("TELESRV_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set TELESRV_TEST_POSTGRES_DSN to exercise the atomic PostgreSQL invoice aggregate")
+	}
+	if err := postgres.Migrate(dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := postgres.Open(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	suffix := time.Now().UnixNano()
+	users := postgres.NewUserStore(pool)
+	botStore := postgres.NewBotStore(pool)
+	dialogs := postgres.NewDialogStore(pool)
+	msgStore := postgres.NewMessageStore(pool)
 	bots := appbots.NewService(users, botStore, msgStore)
 
-	buyer, err := users.Create(ctx, domain.User{AccessHash: 5502, Phone: "15550005502", FirstName: "Buyer"})
+	buyer, err := users.Create(ctx, domain.User{AccessHash: 5502, Phone: fmt.Sprintf("1555%d", suffix), FirstName: "Buyer"})
 	if err != nil {
 		t.Fatalf("create buyer: %v", err)
 	}
-	bot, _, err := bots.CreateBot(ctx, buyer.ID, "Chain Bot", "chain_bot")
+	bot, _, err := bots.CreateBot(ctx, buyer.ID, "Chain Bot", fmt.Sprintf("chain%x_bot", suffix))
 	if err != nil {
 		t.Fatalf("create bot: %v", err)
 	}
@@ -68,26 +74,30 @@ func newInvoiceChain(t *testing.T) *invoiceChain {
 	// The real messages service, because the store keeps a separate message id
 	// counter per participant box and that difference is the whole point here.
 	messages := appmessages.NewService(msgStore, dialogs)
-	stars := appstars.NewService(memory.NewStarsStore(), appstars.WithStartingGrant(5000))
-	gifts := &invoiceGifts{}
-	updates := memory.NewBotAPIUpdateStore()
+	stars := appstars.NewService(postgres.NewStarsStore(pool), appstars.WithStartingGrant(5000))
+	gifts := postgres.NewStarGiftLifecycleStore(pool, msgStore, 0)
+	updates := postgres.NewBotAPIUpdateStore(pool)
 	r := New(Config{}, Deps{
 		Users:         appusers.NewService(users),
 		Bots:          bots,
 		Messages:      messages,
 		Stars:         stars,
-		Gifts:         gifts,
+		Gifts:         appgifts.NewService(postgres.NewStarGiftStore(pool), nil, 2, appgifts.WithLifecycleStore(gifts)),
 		BotAPIUpdates: updates,
 	}, zaptest.NewLogger(t), clock.System)
 
+	third, err := users.Create(ctx, domain.User{Phone: fmt.Sprintf("1556%d", suffix), AccessHash: 5503, FirstName: "Third"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Box ids are allocated per user, not per chat, so a user who has been
 	// active elsewhere sits at a different counter from a fresh bot. That skew is
 	// ordinary on a real server and it is what makes the two copies of the
 	// invoice carry different ids, so the fixture has to reproduce it: Create
 	// allocates in the buyer's box alone.
 	if _, err := msgStore.Create(ctx, domain.Message{
-		OwnerUserID: buyer.ID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: 900001},
-		From: domain.Peer{Type: domain.PeerTypeUser, ID: 900001},
+		OwnerUserID: buyer.ID, Peer: domain.Peer{Type: domain.PeerTypeUser, ID: third.ID},
+		From: domain.Peer{Type: domain.PeerTypeUser, ID: third.ID},
 		Out:  true, Body: "unrelated", Date: 1700000001,
 	}); err != nil {
 		t.Fatalf("skew buyer box: %v", err)
@@ -98,11 +108,11 @@ func newInvoiceChain(t *testing.T) *invoiceChain {
 	}); err != nil {
 		t.Fatalf("buyer message: %v", err)
 	}
-	other, _, err := bots.CreateBot(ctx, buyer.ID, "Other Bot", "chain_other_bot")
+	other, _, err := bots.CreateBot(ctx, buyer.ID, "Other Bot", fmt.Sprintf("chain%x_other_bot", suffix))
 	if err != nil {
 		t.Fatalf("create second bot: %v", err)
 	}
-	return &invoiceChain{r, msgStore, stars, gifts, updates, bot.ID, other.ID, buyer.ID}
+	return &invoiceChain{pool, r, msgStore, stars, gifts, updates, bot.ID, other.ID, buyer.ID}
 }
 
 // buyerInvoiceID finds the invoice as the buyer sees it, by scanning their own
@@ -161,7 +171,7 @@ func TestBotInvoicePaymentChainFromSendToCredit(t *testing.T) {
 	}
 
 	stored, found, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(),
-		chain.botID, chain.botID, payerID)
+		chain.botID, chain.buyerID, payerID)
 	if err != nil || !found {
 		t.Fatalf("invoice under the payer id %d: %v found=%v, want found", payerID, err, found)
 	}
@@ -190,13 +200,13 @@ func TestBotInvoicePaymentChainFromSendToCredit(t *testing.T) {
 	if after != before-100 {
 		t.Fatalf("payer balance = %d, want %d", after, before-100)
 	}
-	if chain.gifts.balance != 100 {
-		t.Fatalf("bot wallet = %d, want 100", chain.gifts.balance)
+	if chain.walletBalance(t) != 100 {
+		t.Fatalf("bot wallet = %d, want 100", chain.walletBalance(t))
 	}
 
 	chain.pay(t, stored.ID, invoice)
-	if chain.gifts.balance != 100 {
-		t.Fatalf("bot wallet after repeat = %d, want 100 (idempotent)", chain.gifts.balance)
+	if chain.walletBalance(t) != 100 {
+		t.Fatalf("bot wallet after repeat = %d, want 100 (idempotent)", chain.walletBalance(t))
 	}
 
 	if got := chain.payerBalance(t); got != after {
@@ -218,13 +228,13 @@ func (c *invoiceChain) payViaStarsForm(t *testing.T, amount int64) {
 	}
 	payerID := c.newestInvoiceID(t)
 	inv := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: c.botID, AccessHash: 1}, MsgID: payerID}
-	stored, found, err := c.router.deps.Bots.BotInvoiceByMessage(context.Background(), c.botID, c.botID, payerID)
+	stored, found, err := c.router.deps.Bots.BotInvoiceByMessage(context.Background(), c.botID, c.buyerID, payerID)
 	if err != nil || !found {
 		t.Fatalf("second invoice lookup: %v found=%v", err, found)
 	}
 
 	before := c.payerBalance(t)
-	wallet := c.gifts.balance
+	wallet := c.walletBalance(t)
 	go c.answerNext(c.botID, domain.BotPreCheckoutAnswer{OK: true})
 	res := c.dispatch(t, c.buyerID, &tg.PaymentsSendStarsFormRequest{
 		FormID:  stored.ID + botInvoiceFormIDBase,
@@ -236,8 +246,8 @@ func (c *invoiceChain) payViaStarsForm(t *testing.T, amount int64) {
 	if got := c.payerBalance(t); got != before-amount {
 		t.Fatalf("payer balance after stars form = %d, want %d", got, before-amount)
 	}
-	if c.gifts.balance != wallet+amount {
-		t.Fatalf("bot wallet after stars form = %d, want %d", c.gifts.balance, wallet+amount)
+	if c.walletBalance(t) != wallet+amount {
+		t.Fatalf("bot wallet after stars form = %d, want %d", c.walletBalance(t), wallet+amount)
 	}
 }
 
@@ -292,14 +302,14 @@ func TestBotInvoiceRefundChain(t *testing.T) {
 	}
 	payerID := chain.newestInvoiceID(t)
 	invoice := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: chain.botID, AccessHash: 1}, MsgID: payerID}
-	stored, found, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.botID, payerID)
+	stored, found, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.buyerID, payerID)
 	if err != nil || !found {
 		t.Fatalf("invoice lookup: %v found=%v", err, found)
 	}
 	chain.pay(t, stored.ID, invoice)
 
 	start := chain.payerBalance(t)
-	wallet := chain.gifts.balance
+	wallet := chain.walletBalance(t)
 	chargeID := botInvoiceChargeID(stored)
 
 	// A bot that does not own the charge is refused, and must not consume the
@@ -311,8 +321,8 @@ func TestBotInvoiceRefundChain(t *testing.T) {
 	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID+1, chargeID); err == nil {
 		t.Fatal("a refund redirected to another user_id was accepted")
 	}
-	if chain.gifts.balance != wallet {
-		t.Fatalf("wallet moved on a refused refund: %d, want %d", chain.gifts.balance, wallet)
+	if chain.walletBalance(t) != wallet {
+		t.Fatalf("wallet moved on a refused refund: %d, want %d", chain.walletBalance(t), wallet)
 	}
 
 	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID, chargeID); err != nil {
@@ -321,8 +331,8 @@ func TestBotInvoiceRefundChain(t *testing.T) {
 	if got := chain.payerBalance(t); got != start+100 {
 		t.Fatalf("buyer balance after refund = %d, want %d", got, start+100)
 	}
-	if chain.gifts.balance != wallet-100 {
-		t.Fatalf("bot wallet after refund = %d, want %d", chain.gifts.balance, wallet-100)
+	if chain.walletBalance(t) != wallet-100 {
+		t.Fatalf("bot wallet after refund = %d, want %d", chain.walletBalance(t), wallet-100)
 	}
 
 	// A repeat is a no-op rather than a second reversal.
@@ -332,8 +342,8 @@ func TestBotInvoiceRefundChain(t *testing.T) {
 	if got := chain.payerBalance(t); got != start+100 {
 		t.Fatalf("buyer balance after repeat = %d, want %d", got, start+100)
 	}
-	if chain.gifts.balance != wallet-100 {
-		t.Fatalf("bot wallet after repeat = %d, want %d", chain.gifts.balance, wallet-100)
+	if chain.walletBalance(t) != wallet-100 {
+		t.Fatalf("bot wallet after repeat = %d, want %d", chain.walletBalance(t), wallet-100)
 	}
 }
 
@@ -349,7 +359,7 @@ func TestBotInvoicePaidNotifiesBotWithChargeID(t *testing.T) {
 	}
 	payerID := chain.newestInvoiceID(t)
 	invoice := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: chain.botID, AccessHash: 1}, MsgID: payerID}
-	stored, _, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.botID, payerID)
+	stored, _, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.buyerID, payerID)
 	if err != nil {
 		t.Fatalf("lookup: %v", err)
 	}
@@ -440,4 +450,13 @@ func countPaymentMessages(t *testing.T, chain *invoiceChain) int {
 		}
 	}
 	return count
+}
+
+func (c *invoiceChain) walletBalance(t *testing.T) int64 {
+	t.Helper()
+	balance, err := c.gifts.BotStarsBalance(context.Background(), c.botID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return balance
 }

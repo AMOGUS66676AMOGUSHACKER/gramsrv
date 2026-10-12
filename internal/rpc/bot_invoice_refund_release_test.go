@@ -2,61 +2,47 @@ package rpc
 
 import (
 	"context"
-	"errors"
-	"testing"
-
 	"github.com/iamxvbaba/td/tg"
-
 	"telesrv/internal/domain"
+	"testing"
 )
 
-// refundFailGifts refuses the debit leg, standing in for an overdraft.
-type refundFailGifts struct {
-	GiftsService
-	err   error
-	debit bool
-}
-
-func (g *refundFailGifts) CreditBotStarsWallet(_ context.Context, credit domain.BotStarsCredit) (int64, bool, error) {
-	if credit.Amount < 0 {
-		g.debit = true
-		if g.err != nil {
-			return 0, false, g.err
+func TestBotInvoiceRefundFailureRollsBackAndCanRetry(t *testing.T) {
+	c := newInvoiceChain(t)
+	ctx := context.Background()
+	if _, err := c.router.BotAPISendInvoice(ctx, c.botID, c.buyerID, "Item", "Description", "refund-fail", 100); err != nil {
+		t.Fatal(err)
+	}
+	id := c.newestInvoiceID(t)
+	stored, found, err := c.router.deps.Bots.BotInvoiceByMessage(ctx, c.botID, c.buyerID, id)
+	if err != nil || !found {
+		t.Fatalf("invoice: %v %v", found, err)
+	}
+	c.pay(t, stored.ID, &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: c.botID, AccessHash: 1}, MsgID: id})
+	charge := botInvoiceChargeID(stored)
+	credit := domain.BotStarsCredit{BotUserID: c.botID, PayerUserID: c.buyerID, Amount: -100, Reason: domain.StarsReasonBotRefund, InvoiceKey: charge + "-spend", Date: 1700000001}
+	if _, _, err := c.gifts.CreditBotStarsWallet(ctx, credit); err != nil {
+		t.Fatal(err)
+	}
+	balance := c.payerBalance(t)
+	if _, err := c.router.BotAPIRefundStarPayment(ctx, c.botID, c.buyerID, charge); err == nil {
+		t.Fatal("refund without funds succeeded")
+	}
+	got, _, err := c.router.deps.Bots.BotInvoiceByCharge(ctx, charge)
+	if err != nil || got.Refunded || c.payerBalance(t) != balance {
+		t.Fatalf("failed refund changed state: %+v %v", got, err)
+	}
+	credit.Amount = 100
+	credit.InvoiceKey = charge + "-replenish"
+	if _, _, err := c.gifts.CreditBotStarsWallet(ctx, credit); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := c.router.BotAPIRefundStarPayment(ctx, c.botID, c.buyerID, charge); err != nil {
+			t.Fatal(err)
 		}
 	}
-	return 0, true, nil
-}
-
-func TestBotInvoiceRefundReleasesFlagWhenWalletRefuses(t *testing.T) {
-	chain := newInvoiceChain(t)
-	gifts := &refundFailGifts{err: errors.New("wallet overdrawn")}
-	chain.router.deps.Gifts = gifts
-
-	if _, err := chain.router.BotAPISendInvoice(context.Background(),
-		chain.botID, chain.buyerID, "Товар", "Оплата", "refund-fail", 100); err != nil {
-		t.Fatalf("sendInvoice: %v", err)
-	}
-	payerID := chain.newestInvoiceID(t)
-	invoice := &tg.InputInvoiceMessage{Peer: &tg.InputPeerUser{UserID: chain.botID, AccessHash: 1}, MsgID: payerID}
-	stored, _, err := chain.router.deps.Bots.BotInvoiceByMessage(context.Background(), chain.botID, chain.botID, payerID)
-	if err != nil {
-		t.Fatalf("lookup: %v", err)
-	}
-	chain.pay(t, stored.ID, invoice)
-	chargeID := botInvoiceChargeID(stored)
-
-	if _, err := chain.router.BotAPIRefundStarPayment(context.Background(), chain.botID, chain.buyerID, chargeID); err == nil {
-		t.Fatal("refund succeeded despite the wallet refusing the debit")
-	}
-	if !gifts.debit {
-		t.Fatal("the refund never reached the wallet")
-	}
-	// The charge must not stay flagged, or the retry would be swallowed as a replay.
-	got, found, err := chain.router.deps.Bots.BotInvoiceByCharge(context.Background(), chargeID)
-	if err != nil || !found {
-		t.Fatalf("charge lookup after failed refund: %v found=%v", err, found)
-	}
-	if got.Refunded {
-		t.Fatal("the refund flag survived a failed refund, so the retry is dead")
+	if c.walletBalance(t) != 0 || c.payerBalance(t) != balance+100 {
+		t.Fatal("retry moved funds more than once")
 	}
 }

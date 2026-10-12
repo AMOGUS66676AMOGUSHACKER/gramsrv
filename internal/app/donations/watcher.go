@@ -61,6 +61,13 @@ func (s *Service) WatchChain(ctx context.Context, chainKey string, pollInterval 
 		return fmt.Errorf("donations: dial %s: %w", chain.Key, err)
 	}
 	defer client.Close()
+	networkID, err := client.ChainID(ctx)
+	if err != nil {
+		return fmt.Errorf("read donation chain ID: %w", err)
+	}
+	if networkID.Cmp(big.NewInt(chain.ChainID)) != 0 {
+		return fmt.Errorf("donation chain ID mismatch")
+	}
 
 	if pollInterval <= 0 {
 		pollInterval = 5 * time.Second
@@ -86,6 +93,17 @@ func (s *Service) WatchChain(ctx context.Context, chainKey string, pollInterval 
 }
 
 func (s *Service) scanOnce(ctx context.Context, client *ethclient.Client, chain domain.DonationChain, tokens []domain.DonationToken, log *zap.Logger) error {
+	current, found, err := s.store.DonationChain(ctx, chain.Key)
+	if err != nil {
+		return err
+	}
+	if !found || !current.Watchable() {
+		return domain.ErrDonationChainDisabled
+	}
+	if current.RPCURL != chain.RPCURL || current.ChainID != chain.ChainID {
+		return fmt.Errorf("donation endpoint changed; restart watcher")
+	}
+	chain = current
 	latest, err := client.BlockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("get latest block: %w", err)
@@ -103,7 +121,7 @@ func (s *Service) scanOnce(ctx context.Context, client *ethclient.Client, chain 
 	}
 	to := latest
 	if to < from {
-		return s.refreshConfirmationsAndCredit(ctx, chain, latest, log)
+		return s.refreshConfirmationsAndCredit(ctx, client, chain, latest, log)
 	}
 	if to-from > maxScanBatchBlocks {
 		to = from + maxScanBatchBlocks
@@ -120,7 +138,7 @@ func (s *Service) scanOnce(ctx context.Context, client *ethclient.Client, chain 
 	if err := s.store.SetDonationChainCursor(ctx, chain.Key, int64(to)); err != nil {
 		return err
 	}
-	return s.refreshConfirmationsAndCredit(ctx, chain, latest, log)
+	return s.refreshConfirmationsAndCredit(ctx, client, chain, latest, log)
 }
 
 func (s *Service) scanNativeTransfers(ctx context.Context, client *ethclient.Client, chain domain.DonationChain, from, to uint64, log *zap.Logger) error {
@@ -203,7 +221,7 @@ func (s *Service) recordDeposit(ctx context.Context, chain domain.DonationChain,
 // confirmation count against the latest known block height, then credits
 // Stars for anything that has just reached (or previously reached, e.g.
 // after a restart) the chain's required depth.
-func (s *Service) refreshConfirmationsAndCredit(ctx context.Context, chain domain.DonationChain, latest uint64, log *zap.Logger) error {
+func (s *Service) refreshConfirmationsAndCredit(ctx context.Context, client depositChainReader, chain domain.DonationChain, latest uint64, log *zap.Logger) error {
 	pending, err := s.store.PendingDonationDeposits(ctx, chain.Key)
 	if err != nil {
 		return err
@@ -229,14 +247,29 @@ func (s *Service) refreshConfirmationsAndCredit(ctx context.Context, chain domai
 	if err != nil {
 		return err
 	}
-	tokenDecimals := make(map[string]int, len(tokensByChain))
+	tokenBySymbol := make(map[string]domain.DonationToken, len(tokensByChain))
 	for _, t := range tokensByChain {
-		tokenDecimals[t.Symbol] = t.Decimals
+		tokenBySymbol[t.Symbol] = t
 	}
 	for _, d := range confirmed {
 		decimals := chain.NativeDecimals
 		if d.TokenSymbol != "" {
-			decimals = tokenDecimals[d.TokenSymbol]
+			decimals = tokenBySymbol[d.TokenSymbol].Decimals
+		}
+		address, found, err := s.store.DonationAddressForUser(ctx, d.UserID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return fmt.Errorf("donation deposit %d has no assigned address", d.ID)
+		}
+		verified, err := verifyDeposit(ctx, client, d, address.Address, tokenBySymbol[d.TokenSymbol], latest, chain.ConfirmationsRequired)
+		if err != nil {
+			return err
+		}
+		if !verified {
+			log.Warn("donation deposit awaiting canonical successful transfer", zap.Int64("deposit_id", d.ID))
+			continue
 		}
 		amount, ok := new(big.Int).SetString(d.AmountRaw, 10)
 		if !ok {

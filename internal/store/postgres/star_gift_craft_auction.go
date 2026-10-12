@@ -216,9 +216,6 @@ func (s *StarGiftLifecycleStore) ListCraftStarGifts(ctx context.Context, userID,
 			return domain.SavedStarGiftPage{}, err
 		}
 	}
-	if !allowed {
-		return domain.SavedStarGiftPage{}, nil
-	}
 	args := []any{userID}
 	where := `p.owner_peer_type='user' AND p.owner_peer_id=$1
 	AND p.lifecycle_status='active' AND p.unique_gift_id IS NOT NULL
@@ -288,7 +285,7 @@ ORDER BY p.id DESC LIMIT $`+fmt.Sprint(len(args)), args...)
 				gifts[i].CanCraftAt = 1
 			}
 			if gifts[i].Unique.CraftChancePermille == 0 {
-				gifts[i].Unique.CraftChancePermille = crossCollectionCraftChancePermille
+				gifts[i].Unique.CraftChancePermille = s.crossCraftChance
 			}
 		}
 	}
@@ -302,13 +299,6 @@ ORDER BY p.id DESC LIMIT $`+fmt.Sprint(len(args)), args...)
 func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.StarGiftCraftRequest) (domain.StarGiftCraftResult, error) {
 	if s == nil || s.db == nil || s.messages == nil || s.craftDraw == nil || req.UserID <= 0 || len(req.Refs) < 1 || len(req.Refs) > 4 || req.Date <= 0 ||
 		strings.TrimSpace(req.CommandKey) == "" || len(req.CommandKey) > 256 {
-		return domain.StarGiftCraftResult{}, domain.ErrStarGiftCraftUnavailable
-	}
-	allowed, err := s.crossCraftAllowed(ctx, req.UserID)
-	if err != nil {
-		return domain.StarGiftCraftResult{}, err
-	}
-	if !allowed {
 		return domain.StarGiftCraftResult{}, domain.ErrStarGiftCraftUnavailable
 	}
 	owner := domain.Peer{Type: domain.PeerTypeUser, ID: req.UserID}
@@ -356,6 +346,7 @@ func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.S
 		savedByID := make(map[int64]domain.SavedStarGift, len(savedIDs))
 		uniqueIDs := make([]int64, 0, len(savedIDs))
 		var giftID, revisionID int64
+		chance := 0
 		giftIDs := make(map[int64]struct{}, len(savedIDs))
 		for i := range req.Refs {
 			saved, err := lockSavedStarGiftByID(ctx, tx, savedIDs[i])
@@ -366,7 +357,7 @@ func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.S
 			unique, found, err := NewStarGiftStore(tx).UniqueByID(ctx, saved.UniqueGiftID)
 			checkUnique := unique
 			if prepared.mixed && checkUnique.CraftChancePermille == 0 {
-				checkUnique.CraftChancePermille = crossCollectionCraftChancePermille
+				checkUnique.CraftChancePermille = s.crossCraftChance
 			}
 			if err != nil || !found || !starGiftCraftInputAvailable(checkUnique, owner, i == 0) {
 				return domain.ErrStarGiftCraftUnavailable
@@ -380,15 +371,35 @@ func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.S
 				return domain.ErrStarGiftCraftUnavailable
 			}
 			giftIDs[unique.GiftID] = struct{}{}
+			chance += unique.CraftChancePermille
 			savedByID[saved.ID] = saved
 			uniqueIDs = append(uniqueIDs, unique.ID)
 		}
-		// The catalog-only craft path is disabled: AI can create a new model
-		// even when this collection has no prebuilt crafted model.
-		// Previously, ordinary crafts queried crafted catalog rows here.
-		draw := prepared.draw
-		result.Chance = crossCollectionCraftChancePermille
-		result.Success = draw < crossCollectionCraftChancePermille
+		if prepared.mixed {
+			result.Chance = prepared.chance
+			result.Success = prepared.draw < prepared.chance
+		} else {
+			if chance > 1000 {
+				chance = 1000
+			}
+			var craftable bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM star_gift_collectible_models
+WHERE collectible_revision_id=$1 AND crafted
+)`, revisionID).Scan(&craftable); err != nil {
+				return err
+			}
+			if !craftable {
+				return domain.ErrStarGiftCraftUnavailable
+			}
+			draw, err := s.craftDraw(1000)
+			if err != nil {
+				return fmt.Errorf("draw star gift craft outcome: %w", err)
+			}
+			result.Chance = chance
+			result.Success = draw < chance
+
+		}
 
 		if _, err := tx.Exec(ctx, `SELECT id FROM unique_star_gifts WHERE id=ANY($1::bigint[]) ORDER BY id FOR UPDATE`, sortedUniqueInt64(uniqueIDs)); err != nil {
 			return err
@@ -420,9 +431,17 @@ func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.S
 
 		firstSavedID, firstUniqueID := savedIDs[0], uniqueIDs[0]
 		if result.Success {
-			// Legacy ordinary craft route is intentionally disabled:
-			// modelID, err = chooseCraftedModel(ctx, tx, revisionID)
-			modelID, backdropID, err := insertCrossCraftAttributes(ctx, tx, revisionID, prepared)
+			var modelID, backdropID int64
+			var err error
+			if prepared.mixed {
+				modelID, backdropID, err = insertCrossCraftAttributes(ctx, tx, revisionID, prepared)
+			} else {
+				modelID, err = chooseCraftedModel(ctx, tx, revisionID)
+				if err == nil {
+					backdropID, err = chooseCollectibleAttribute(ctx, tx, "star_gift_collectible_backdrops", revisionID)
+				}
+			}
+
 			if err != nil {
 				return err
 			}
@@ -430,8 +449,6 @@ func (s *StarGiftLifecycleStore) CraftStarGift(ctx context.Context, req domain.S
 			if err != nil {
 				return err
 			}
-			// Legacy ordinary craft backdrop selection is disabled; the AI
-			// composition receives the blended source backdrop above.
 			if _, err := tx.Exec(ctx, `UPDATE unique_star_gifts SET model_attribute_id=$2,pattern_attribute_id=$3,
 	backdrop_attribute_id=$4,crafted=true,craft_chance_permille=0,offer_min_stars=0,updated_at=now() WHERE id=$1`, firstUniqueID, modelID, patternID, backdropID); err != nil {
 				return err
@@ -1189,7 +1206,7 @@ current_round,total_rounds,round_duration,status FROM star_gift_auctions WHERE g
 			Scan(&out.AveragePrice); err != nil {
 			return domain.StarGiftAuction{}, err
 		}
-		if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=$1`, giftID).
+		if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=$1 AND NOT l.suspended`, giftID).
 			Scan(&out.ListedCount); err != nil {
 			return domain.StarGiftAuction{}, err
 		}

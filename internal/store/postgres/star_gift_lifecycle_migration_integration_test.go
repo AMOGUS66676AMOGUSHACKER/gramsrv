@@ -37,7 +37,7 @@ func embeddedMigrationVersions(t *testing.T, suffix string) map[uint]string {
 			t.Fatalf("migration %q has no version prefix", name)
 		}
 
-		version, err := strconv.ParseUint(prefix, 10, 32)
+		version, err := strconv.ParseUint(prefix, 10, strconv.IntSize)
 		if err != nil {
 			t.Fatalf("migration %q has a non-numeric version prefix: %v", name, err)
 		}
@@ -98,6 +98,23 @@ func TestEmbeddedMigrationsAreContiguousAndReversible(t *testing.T) {
 		}
 
 		previous := versions[index-1]
+		// These published timestamp versions follow the original numbered chain.
+		// Pin every predecessor so future additions cannot silently fill a gap.
+		timestampPredecessors := map[uint]uint{
+			20260924140000: 222,
+			20260924150000: 20260924140000,
+			20260926010000: 20260924150000,
+			20260927010000: 20260926010000,
+			20260928010000: 20260927010000,
+			20260928020000: 20260928010000,
+			20260928030000: 20260928020000,
+		}
+		if expected, ok := timestampPredecessors[version]; ok {
+			if previous != expected {
+				t.Fatalf("migration %d predecessor = %d, want %d", version, previous, expected)
+			}
+			continue
+		}
 		for missing := previous + 1; missing < version; missing++ {
 			if _, allowed := knownMigrationGaps[missing]; allowed {
 				continue

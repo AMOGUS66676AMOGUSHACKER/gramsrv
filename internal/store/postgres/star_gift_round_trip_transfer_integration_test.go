@@ -135,7 +135,7 @@ func TestStarGiftRoundTripTransferNotReplayedPostgres(t *testing.T) {
 
 	back, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
 		ActorUserID: bob.ID, Ref: domain.SavedStarGiftRef{Owner: bobPeer, MsgID: toBob.Saved.MsgID},
-		To: alicePeer, ChargeStars: 25, FormID: formID, CommandKey: commandKey, Date: now + 3,
+		To: alicePeer, ChargeStars: 25, FormID: formID, CommandKey: commandKey, Date: now + 2,
 	})
 	if err != nil || back.Duplicate || back.Unique.Owner != alicePeer {
 		t.Fatalf("bob -> alice = %+v err %v, want a fresh transfer to %+v", back.Unique.Owner, err, alicePeer)
@@ -143,7 +143,7 @@ func TestStarGiftRoundTripTransferNotReplayedPostgres(t *testing.T) {
 
 	again, err := lifecycle.TransferStarGift(ctx, domain.StarGiftTransferRequest{
 		ActorUserID: alice.ID, Ref: domain.SavedStarGiftRef{Owner: alicePeer, MsgID: back.Saved.MsgID},
-		To: bobPeer, ChargeStars: 25, FormID: formID, CommandKey: commandKey, Date: now + 4,
+		To: bobPeer, ChargeStars: 25, FormID: formID, CommandKey: commandKey, Date: now + 2,
 	})
 	if err != nil {
 		t.Fatalf("alice -> bob again: %v", err)

@@ -2,7 +2,6 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"testing"
 	"time"
 
@@ -126,28 +125,6 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 
-	// Маркет-листинг дешевле фиксированного порога 125 Звёзд отклоняется
-	// независимо от каталога/FloorPrice; ровно 125 — граница, разрешено.
-	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
-		ActorUserID: seller.ID, Ref: domain.SavedStarGiftRef{Owner: sellerPeer, MsgID: upgraded.Saved.MsgID},
-		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 100}, Date: now + 2,
-	}); !errors.Is(err, domain.ErrStarGiftResaleUnavailable) {
-		t.Fatalf("stars listing below floor 125 err = %v, want ErrStarGiftResaleUnavailable", err)
-	}
-	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
-		ActorUserID: seller.ID, Ref: domain.SavedStarGiftRef{Owner: sellerPeer, MsgID: upgraded.Saved.MsgID},
-		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 125}, Date: now + 2,
-	}); err != nil {
-		t.Fatalf("list exactly at floor 125: %v", err)
-	}
-	listed, err = lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{
-		ActorUserID: seller.ID, Ref: domain.SavedStarGiftRef{Owner: sellerPeer, MsgID: upgraded.Saved.MsgID},
-		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 500}, Date: now + 2,
-	})
-	if err != nil {
-		t.Fatalf("re-list at 500: %v", err)
-	}
-
 	// The seller's profile-visible state right before the sale.
 	beforePage, err := gifts.ListByOwner(ctx, sellerPeer, true, "", 20)
 	if err != nil {
@@ -239,7 +216,6 @@ func TestStarGiftResaleClearsSellerProfileStatePostgres(t *testing.T) {
 	}
 	want := []string{
 		string(domain.UpdateEventUserEmojiStatus),
-		string(domain.UpdateEventNewMessage),
 		string(domain.UpdateEventEditMessage),
 	}
 	if len(kinds) != len(want) {

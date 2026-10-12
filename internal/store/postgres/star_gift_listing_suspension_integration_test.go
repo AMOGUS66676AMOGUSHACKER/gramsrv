@@ -102,12 +102,7 @@ func TestStarGiftResaleSuspendedByAccountFreezePostgres(t *testing.T) {
 	// Второй продавец выставляет дороже, поэтому после заморозки первого пол,
 	// витрина и проекции каталога обязаны считать только листинг второго: если
 	// suspended попадёт в агрегаты, пол останется на заниженной цене первого.
-	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: peerSeller.ID,
-		Ref:    peerRef,
-		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 900}, Date: now + 12,
-	}); err != nil {
-		t.Fatalf("peer listing: %v", err)
-	}
+
 	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: seller.ID,
 		Ref:    sellerRef,
 		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 500}, Date: now + 2,
@@ -115,6 +110,12 @@ func TestStarGiftResaleSuspendedByAccountFreezePostgres(t *testing.T) {
 		t.Fatalf("seller listing: %v", err)
 	}
 
+	if _, err := lifecycle.SetStarGiftListing(ctx, domain.StarGiftListingRequest{ActorUserID: peerSeller.ID,
+		Ref:    peerRef,
+		Amount: &domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: 900}, Date: now + 12,
+	}); err != nil {
+		t.Fatalf("peer listing: %v", err)
+	}
 	listedIDs := func() map[int64]bool {
 		t.Helper()
 		page, err := lifecycle.ListResaleStarGifts(ctx, domain.StarGiftResaleFilter{GiftID: entry.Gift.ID, Limit: 10})

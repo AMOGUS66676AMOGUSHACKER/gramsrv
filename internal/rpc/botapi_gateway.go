@@ -289,6 +289,8 @@ func (r *Router) BotAPISendMessage(ctx context.Context, botID, chatID int64, tex
 	if utf8.RuneCountInString(text) > domain.MaxMessageTextLength {
 		return domain.Message{}, errors.New("MESSAGE_TOO_LONG")
 	}
+	// 服务端自动实体补全必须早于私聊/频道分流，两条写路径落同一份结果。
+	entities = r.augmentBotAPIAutoEntities(text, entities)
 	var reply *domain.MessageReply
 	if replyToMessageID > 0 {
 		reply = &domain.MessageReply{Peer: peer, MessageID: replyToMessageID}
@@ -402,6 +404,8 @@ func (r *Router) BotAPISendMedia(ctx context.Context, botID, chatID int64, kind,
 	if utf8.RuneCountInString(caption) > domain.MaxMessageTextLength {
 		return domain.Message{}, errors.New("MESSAGE_TOO_LONG")
 	}
+	// caption 与正文同口径：/buy 等命令、@mention、裸域名都要有服务端实体才蓝显。
+	entities = r.augmentBotAPIAutoEntities(caption, entities)
 	media, err := r.botAPIMedia(ctx, botID, kind, locationKey, remoteURL, fileName, mimeType, fileBytes)
 	if err != nil {
 		return domain.Message{}, err
@@ -456,7 +460,9 @@ func (r *Router) BotAPISendEphemeral(ctx context.Context, input domain.BotAPIEph
 		return domain.EphemeralMessage{}, err
 	}
 	baseContent := domain.EphemeralContent{
-		Message: input.Text, Entities: append([]domain.MessageEntity(nil), input.Entities...), ReplyMarkup: input.ReplyMarkup,
+		Message:     input.Text,
+		Entities:    r.augmentBotAPIAutoEntities(input.Text, append([]domain.MessageEntity(nil), input.Entities...)),
+		ReplyMarkup: input.ReplyMarkup,
 	}
 	if !utf8.ValidString(baseContent.Message) || utf8.RuneCountInString(baseContent.Message) > domain.MaxMessageTextLength || len(baseContent.Entities) > domain.MaxMessageEntityCount ||
 		!validEphemeralEntityBounds(baseContent.Message, baseContent.Entities) {
@@ -511,6 +517,9 @@ func (r *Router) BotAPIEditEphemeral(ctx context.Context, input domain.BotAPIEph
 		if err := r.validateReplyMarkupForPeer(ctx, input.BotUserID, peer, fields.ReplyMarkup); err != nil {
 			return false, err
 		}
+	}
+	if fields.SetMessage {
+		fields.Entities = r.augmentBotAPIAutoEntities(fields.Message, fields.Entities)
 	}
 	if fields.SetMessage && (!utf8.ValidString(fields.Message) || !validEphemeralEntityBounds(fields.Message, fields.Entities) || utf8.RuneCountInString(fields.Message) > domain.MaxMessageTextLength) {
 		return false, errors.New("ENTITY_BOUNDS_INVALID")
@@ -936,6 +945,7 @@ func (r *Router) BotAPIEditMessageText(ctx context.Context, botID, chatID int64,
 			return domain.Message{}, err
 		}
 	}
+	entities = r.augmentBotAPIAutoEntities(text, entities)
 	res, err := r.deps.Messages.EditMessage(ctx, botID, domain.EditMessageRequest{
 		OwnerUserID:    botID,
 		Peer:           peer,
@@ -1046,7 +1056,8 @@ func (r *Router) BotAPIEditInlineMessageText(ctx context.Context, botID int64, i
 		NoWebpage: disableWebPagePreview,
 	}
 	req.SetMessage(text)
-	if len(entities) > 0 {
+	// inline 消息同样由服务端补自动实体，否则 /buy 在 inline 结果里不蓝显。
+	if entities = r.augmentBotAPIAutoEntities(text, entities); len(entities) > 0 {
 		req.SetEntities(tgMessageEntities(entities))
 	}
 	if setReplyMarkup {
@@ -1180,25 +1191,4 @@ func (r *Router) BotAPIGetFile(ctx context.Context, botID int64, locationKey str
 		Offset:      offset,
 		Limit:       limit,
 	})
-}
-
-// BotAPIAvailableGifts returns the current star gift catalog for bot purchases.
-func (r *Router) BotAPIAvailableGifts(ctx context.Context) ([]domain.StarGift, error) {
-	if r == nil {
-		return nil, errors.New("STAR_GIFTS_UNAVAILABLE")
-	}
-	// Stub implementation - StarGifts dependency not yet wired in Deps
-	return nil, errors.New("STAR_GIFTS_UNAVAILABLE")
-}
-
-// BotAPISendStarGift purchases and sends one gift out of the bot's Stars balance.
-// userID and chatID are the two mutually exclusive Bot API recipient selectors;
-// the gateway resolves whichever is non-zero into a peer. requestID is the
-// telesrv idempotency key (empty means "charge again").
-func (r *Router) BotAPISendStarGift(ctx context.Context, botID, giftID, userID, chatID int64, payForUpgrade bool, message domain.PremiumGiftMessage, requestID string) (bool, error) {
-	if r == nil {
-		return false, errors.New("STAR_GIFTS_UNAVAILABLE")
-	}
-	// Stub implementation - StarGifts dependency not yet wired in Deps
-	return false, errors.New("STAR_GIFTS_UNAVAILABLE")
 }

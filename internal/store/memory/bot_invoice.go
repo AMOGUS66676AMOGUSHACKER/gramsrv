@@ -52,28 +52,6 @@ func (l *botInvoiceLedger) byMessage(botUserID, chatID int64, messageID int) (do
 	return invoice, found
 }
 
-// settle is a compare-and-set: only the first caller flips paid, so a replayed
-// sendPaymentForm reads the stored receipt instead of charging again.
-func (l *botInvoiceLedger) settle(botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	key := botInvoiceKey{botUserID, chatID, messageID}
-	invoice, found := l.byMsg[key]
-	if !found {
-		return domain.BotInvoice{}, false, nil
-	}
-	if invoice.Paid || invoice.Refunded {
-		return invoice, false, nil
-	}
-	invoice.Paid = true
-	invoice.ChargeID = chargeID
-	invoice.PayerID = payerUserID
-	invoice.PaidAt = date
-	l.byMsg[key] = invoice
-	l.byCharge[chargeID] = key
-	return invoice, true, nil
-}
-
 func (l *botInvoiceLedger) byChargeID(chargeID string) (domain.BotInvoice, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -82,35 +60,6 @@ func (l *botInvoiceLedger) byChargeID(chargeID string) (domain.BotInvoice, error
 		return domain.BotInvoice{}, domain.ErrBotInvoiceNotFound
 	}
 	return l.byMsg[key], nil
-}
-
-func (l *botInvoiceLedger) markRefunded(chargeID string) (bool, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	key, found := l.byCharge[chargeID]
-	if !found {
-		return false, domain.ErrBotInvoiceNotFound
-	}
-	invoice := l.byMsg[key]
-	if invoice.Refunded {
-		return false, nil
-	}
-	invoice.Refunded = true
-	l.byMsg[key] = invoice
-	return true, nil
-}
-
-func (l *botInvoiceLedger) releaseRefund(chargeID string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	key, found := l.byCharge[chargeID]
-	if !found {
-		return domain.ErrBotInvoiceNotFound
-	}
-	invoice := l.byMsg[key]
-	invoice.Refunded = false
-	l.byMsg[key] = invoice
-	return nil
 }
 
 func (s *BotStore) CreateBotInvoice(_ context.Context, invoice domain.BotInvoice) (domain.BotInvoice, error) {
@@ -128,13 +77,6 @@ func (s *BotStore) BotInvoiceByMessage(_ context.Context, botUserID, chatID int6
 	return invoice, found, nil
 }
 
-func (s *BotStore) SettleBotInvoice(_ context.Context, botUserID, chatID int64, messageID int, payerUserID int64, chargeID string, date int) (domain.BotInvoice, bool, error) {
-	if botUserID <= 0 || chatID == 0 || messageID <= 0 || payerUserID <= 0 || chargeID == "" || date <= 0 {
-		return domain.BotInvoice{}, false, domain.ErrBotInvoiceInvalid
-	}
-	return s.invoices.settle(botUserID, chatID, messageID, payerUserID, chargeID, date)
-}
-
 func (s *BotStore) BotInvoiceByCharge(_ context.Context, chargeID string) (domain.BotInvoice, bool, error) {
 	if chargeID == "" {
 		return domain.BotInvoice{}, false, domain.ErrBotInvoiceInvalid
@@ -147,18 +89,4 @@ func (s *BotStore) BotInvoiceByCharge(_ context.Context, chargeID string) (domai
 		return domain.BotInvoice{}, false, err
 	}
 	return invoice, true, nil
-}
-
-func (s *BotStore) MarkBotInvoiceRefunded(_ context.Context, chargeID string) (bool, error) {
-	if chargeID == "" {
-		return false, domain.ErrBotInvoiceInvalid
-	}
-	return s.invoices.markRefunded(chargeID)
-}
-
-func (s *BotStore) ReleaseBotInvoiceRefund(_ context.Context, chargeID string) error {
-	if chargeID == "" {
-		return domain.ErrBotInvoiceInvalid
-	}
-	return s.invoices.releaseRefund(chargeID)
 }

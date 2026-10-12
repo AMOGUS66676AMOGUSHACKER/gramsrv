@@ -160,14 +160,22 @@ WHERE id=(SELECT active_revision_id FROM star_gift_catalog WHERE gift_id=$1)`, e
 	}
 
 	hosted := "0:" + strings.Repeat("cd", 32)
-	if _, err := pool.Exec(ctx, `UPDATE unique_star_gifts SET owner_address=$2, owner_peer_type=NULL, owner_peer_id=NULL,
-host_peer_type='user', host_peer_id=$1 WHERE id=$3`, owner.ID, hosted, upgraded.Saved.UniqueGiftID); err != nil {
-		t.Fatalf("host the unique gift: %v", err)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE peer_star_gifts SET lifecycle_status='exported' WHERE id=$1`,
-		upgraded.Saved.ID); err != nil {
-		t.Fatalf("export the unique gift: %v", err)
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `UPDATE unique_star_gifts SET owner_address=$2, owner_peer_type=NULL, owner_peer_id=NULL,
+ host_peer_type='user', host_peer_id=$1 WHERE id=$3`, owner.ID, hosted, upgraded.Saved.UniqueGiftID); err != nil {
+		t.Fatal(err)
 	}
+	if _, err := tx.Exec(ctx, `UPDATE peer_star_gifts SET lifecycle_status='exported' WHERE id=$1`, upgraded.Saved.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
 	plain := domain.SavedStarGiftFilter{Owner: ownerPeer, Limit: 10}
 	hostedPage, err := gifts.ListByOwnerFiltered(ctx, plain)
 	if err != nil || hostedPage.Count != 2 {

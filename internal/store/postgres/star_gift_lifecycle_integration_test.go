@@ -504,7 +504,7 @@ WHERE target_user_id=$1 AND pts=$2 AND event_type='user_emoji_status'`, resaleBu
 		t.Fatalf("collectible invalidation outbox count=%d err=%v, want 1", clearOutboxCount, err)
 	}
 
-	// A second prepaid collectible remains eligible for the fixed 990‰ craft chance. Success
+	// A second prepaid collectible contributes its configured craft chance. Success
 	// preserves the first aggregate as crafted and burns the other input. The
 	// fresh payment intent must create another gift even though buyer, owner and
 	// catalog gift are identical to the first purchase.
@@ -636,7 +636,7 @@ SET lifecycle_status=$2,unsaved=$3,pinned_order=$4,can_craft_at=$5 WHERE unique_
 			{Owner: ownerPeer, Slug: secondUpgrade.Unique.Slug},
 		}, CommandKey: "craft-" + suffix, Date: now + 147,
 	})
-	if err != nil || !crafted.Success || crafted.Chance != 990 || crafted.Gift == nil || !crafted.Gift.Crafted || crafted.Send.RecipientMessage.ID <= 0 {
+	if err != nil || !crafted.Success || crafted.Chance != 1000 || crafted.Gift == nil || !crafted.Gift.Crafted || crafted.Send.RecipientMessage.ID <= 0 {
 		t.Fatalf("craft result = %+v err %v", crafted, err)
 	}
 	craftOutputAction := crafted.Send.SenderMessage.Media.ServiceAction.StarGiftUnique
@@ -768,7 +768,7 @@ WHERE user_id=$1 AND command_key=$2`, owner.ID, craftReq.CommandKey).Scan(&outpu
 		CommandKey: "craft-fail-" + suffix, Date: now + 150,
 	}
 	failedCraft, err := failingLifecycle.CraftStarGift(ctx, failureReq)
-	if err != nil || failedCraft.Success || failedCraft.Chance != 990 || failedCraft.Gift != nil {
+	if err != nil || failedCraft.Success || failedCraft.Chance != 500 || failedCraft.Gift != nil {
 		t.Fatalf("craft failure result = %+v err %v", failedCraft, err)
 	}
 	failedInputEdit := craftedSourceEditForUserAndGift(failedCraft, owner.ID, thirdUpgrade.Unique.ID)
@@ -1746,7 +1746,7 @@ func TestStarGiftCraftFailureConsumesThreeInputsPostgres(t *testing.T) {
 	req := domain.StarGiftCraftRequest{UserID: owner.ID, Refs: refs,
 		CommandKey: "three-input-craft-fail-" + suffix, Date: now + 20}
 	failed, err := lifecycle.CraftStarGift(ctx, req)
-	if err != nil || failed.Success || failed.Chance != 990 || failed.Gift != nil {
+	if err != nil || failed.Success || failed.Chance != 750 || failed.Gift != nil {
 		t.Fatalf("three-input craft failure = %+v err=%v", failed, err)
 	}
 	for _, uniqueID := range uniqueIDs {
@@ -1773,7 +1773,7 @@ FROM star_gift_craft_commands WHERE user_id=$1 AND command_key=$2`, owner.ID, re
 		t.Fatalf("three-input failure receipt pts=%v media=%d fingerprint=%d err=%v", sourcePTS, len(outputMedia), len(outputFingerprint), err)
 	}
 	replay, err := lifecycle.CraftStarGift(ctx, req)
-	if err != nil || !replay.Duplicate || replay.Success || replay.Chance != 990 {
+	if err != nil || !replay.Duplicate || replay.Success || replay.Chance != 750 {
 		t.Fatalf("three-input failure replay = %+v err=%v", replay, err)
 	}
 	for i, uniqueID := range uniqueIDs {

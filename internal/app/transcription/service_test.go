@@ -275,3 +275,70 @@ func TestTranscribeRejectsOversizedDocument(t *testing.T) {
 	}
 	t.Fatalf("oversized row never marked failed")
 }
+
+func TestTranscribeBoundsJobsAndFansOutSharedRetry(t *testing.T) {
+	st := newFakeTranscriptionStore()
+	st.rows[1] = domain.MessageTranscription{DocumentID: 1, TranscriptionID: 42, Status: domain.TranscriptionStatusFailed}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		io.WriteString(w, `{"text":"shared result"}`)
+	}))
+	defer server.Close()
+	defer unblock()
+	svc := NewService(st, &fakeFileSource{data: []byte("ogg"), total: 3}, server.URL, 5*time.Second, zaptest.NewLogger(t))
+	completed := make(chan int64, maxTranscriptionSubscribers+maxConcurrentTranscriptions)
+	svc.SetCompletionHandler(func(_ context.Context, userID int64, _ domain.Peer, _ int, _ int64, _ string) { completed <- userID })
+	peer := domain.Peer{Type: domain.PeerTypeUser, ID: 999}
+	var retryID int64
+	for i := 1; i <= maxTranscriptionSubscribers; i++ {
+		got, err := svc.Transcribe(context.Background(), int64(i), peer, 1, domain.Document{ID: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			retryID = got.TranscriptionID
+		}
+		if !got.Pending || got.TranscriptionID != retryID || retryID == 42 {
+			t.Fatalf("shared retry = %+v", got)
+		}
+	}
+	if _, err := svc.Transcribe(context.Background(), 1000, peer, 1, domain.Document{ID: 1}); err != ErrUnavailable {
+		t.Fatalf("subscriber limit: %v", err)
+	}
+	for i := 2; i <= maxConcurrentTranscriptions; i++ {
+		if _, err := svc.Transcribe(context.Background(), int64(1000+i), peer, 1, domain.Document{ID: int64(i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := svc.Transcribe(context.Background(), 2000, peer, 1, domain.Document{ID: 99}); err != ErrUnavailable {
+		t.Fatalf("job limit: %v", err)
+	}
+	unblock()
+	seen := map[int64]bool{}
+	for i := 0; i < maxTranscriptionSubscribers+maxConcurrentTranscriptions-1; i++ {
+		select {
+		case id := <-completed:
+			if seen[id] {
+				t.Fatalf("duplicate completion %d", id)
+			}
+			seen[id] = true
+		case <-time.After(5 * time.Second):
+			t.Fatal("missing shared completion")
+		}
+	}
+	if hits.Load() != maxConcurrentTranscriptions {
+		t.Fatalf("ASR calls=%d", hits.Load())
+	}
+	if got, err := svc.Transcribe(context.Background(), 1, peer, 1, domain.Document{ID: 1}); err != nil || got.Pending || got.TranscriptionID != retryID {
+		t.Fatalf("cache=%+v %v", got, err)
+	}
+}

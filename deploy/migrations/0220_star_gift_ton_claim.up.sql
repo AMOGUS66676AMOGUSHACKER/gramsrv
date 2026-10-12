@@ -98,4 +98,3 @@ UPDATE public.unique_star_gifts
 SET host_peer_type='user', host_peer_id=1250000019, updated_at=now()
 WHERE owner_address<>'' AND gift_address<>'' AND NOT burned
   AND (host_peer_type IS NULL OR host_peer_id IS NULL);
-

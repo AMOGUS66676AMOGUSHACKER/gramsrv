@@ -12,22 +12,21 @@
 -- registry-строк и деактивация профильных фото. Ровно тот же набор операций, что
 -- теперь делает ExecuteAccountDeletion в одной транзакции.
 
-WITH vaulted AS (
+WITH previous AS MATERIALIZED (
+ SELECT asset.id, asset.owner_peer_id FROM public.collectible_usernames asset
+ JOIN public.users owner ON owner.id=asset.owner_peer_id
+ WHERE asset.status='owned' AND asset.owner_peer_type='user' AND owner.deleted_at IS NOT NULL
+ FOR UPDATE OF asset
+), vaulted AS (
     UPDATE public.collectible_usernames asset
     SET status = 'vault',
         owner_peer_type = '',
         owner_peer_id = 0,
         version = asset.version + 1,
         updated_at = now()
-    WHERE asset.status = 'owned'
-      AND asset.owner_peer_type = 'user'
-      AND EXISTS (
-          SELECT 1
-          FROM public.users owner
-          WHERE owner.id = asset.owner_peer_id
-            AND owner.deleted_at IS NOT NULL
-      )
-    RETURNING asset.id, asset.owner_peer_id
+    FROM previous
+    WHERE asset.id=previous.id
+    RETURNING asset.id,previous.owner_peer_id
 )
 INSERT INTO public.collectible_username_transfers (
     collectible_id, kind, from_peer_type, from_peer_id,

@@ -119,6 +119,63 @@ func validateStarGiftPurchaseRecipient(ctx context.Context, tx pgx.Tx, to domain
 	return nil
 }
 
+// SettledStarGiftPurchase reports the purchase already committed for req.CommandKey.
+// It is the read half of the payment-command table that makes a bot-initiated
+// sendGift idempotent: PurchaseStarGift's own replay check demands the same form_id,
+// and a Bot API retry always mints a fresh form, so the retry would be reported as a
+// failure instead of the success it already achieved.
+//
+// found=false means the key is unused, so the caller must go through the normal
+// issue-and-purchase path. A committed command that disagrees with the request on
+// gift, recipient, upgrade or text returns ErrStarGiftIdempotencyConflict rather
+// than the other request's result: answering true would tell the caller its own,
+// different send succeeded.
+func (s *StarGiftLifecycleStore) SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error) {
+	if s == nil || s.db == nil || req.BuyerUserID <= 0 || !validLifecyclePeer(req.To) ||
+		req.GiftID <= 0 || strings.TrimSpace(req.CommandKey) == "" {
+		return domain.StarGiftPurchaseResult{}, false, domain.ErrStarGiftInvalid
+	}
+	var giftID, savedID, balance, revisionID int64
+	var recipientType, message, entitiesJSON string
+	var recipientID int64
+	var hideName, includeUpgrade bool
+	err := s.db.QueryRow(ctx, `SELECT c.gift_id,c.recipient_peer_type,c.recipient_peer_id,c.saved_gift_id,c.balance_after,
+f.revision_id,f.hide_name,f.include_upgrade,f.message,f.message_entities::text
+FROM star_gift_purchase_commands c JOIN star_gift_purchase_forms f ON f.buyer_user_id=c.buyer_user_id AND f.form_id=c.form_id
+WHERE c.buyer_user_id=$1 AND c.command_key=$2`, req.BuyerUserID, req.CommandKey).
+		Scan(&giftID, &recipientType, &recipientID, &savedID, &balance, &revisionID, &hideName, &includeUpgrade, &message, &entitiesJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.StarGiftPurchaseResult{}, false, nil
+	}
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, false, err
+	}
+	entities, err := decodeMessageEntities(entitiesJSON)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, false, err
+	}
+	if giftID != req.GiftID || recipientType != string(req.To.Type) || recipientID != req.To.ID ||
+		hideName != req.HideName || includeUpgrade != req.IncludeUpgrade || message != req.Message || !slices.Equal(entities, req.MessageEntities) {
+		return domain.StarGiftPurchaseResult{}, false, domain.ErrStarGiftIdempotencyConflict
+	}
+	saved, found, err := savedStarGiftByID(ctx, s.db, savedID)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, false, err
+	}
+	if !found {
+		return domain.StarGiftPurchaseResult{}, false, domain.ErrStarGiftInvalid
+	}
+	gift, found, err := NewStarGiftStore(s.db).CatalogRevision(ctx, revisionID)
+	if err != nil {
+		return domain.StarGiftPurchaseResult{}, false, err
+	}
+	if !found {
+		return domain.StarGiftPurchaseResult{}, false, domain.ErrStarGiftInvalid
+	}
+	return domain.StarGiftPurchaseResult{Gift: gift, Saved: saved,
+		Balance: domain.StarsBalance{UserID: req.BuyerUserID, Balance: balance}, Duplicate: true}, true, nil
+}
+
 func (s *StarGiftLifecycleStore) PurchaseStarGift(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, error) {
 	req.CommandKey = strings.TrimSpace(req.CommandKey)
 	if s == nil || s.db == nil || req.BuyerUserID <= 0 || !validLifecyclePeer(req.To) || req.GiftID <= 0 ||
@@ -323,14 +380,21 @@ last_sale_date=$2,updated_at=now() WHERE gift_id=$1`, gift.ID, req.Date); err !=
 		return domain.StarGift{}, domain.SavedStarGift{}, domain.StarsBalance{}, err
 	}
 	charge := gift.Stars + upgradePrice
-	balance, err := s.debitLifecycleAmount(ctx, tx, req.BuyerUserID,
-		domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: charge}, domain.StarsReasonGift,
-		req.To, req.Date, "Star gift")
+	balance, err := s.debitStarGiftPurchase(ctx, tx, req, charge)
 	if err != nil {
 		return domain.StarGift{}, domain.SavedStarGift{}, domain.StarsBalance{}, err
 	}
+	// 机器人送出的礼物不参与「转换回 Stars」：catalog 的 ConvertStars 是给普通用户
+	// 买家的退款额度，而机器人这一侧的钱是它开票赚来的钱包余额。若照抄，收到礼物的
+	// 对端就能把机器人支出的 Stars 直接兑换回自己的余额，等于给钱包开了一条提现口子。
+	// 这里按付款人身份把它归零：peer_star_gifts.convert_stars 为 0，客户端因此不显示
+	// 转换按钮，ConvertStarGift 也只走 amount==0 的纯归档分支，不产生任何 Credit。
+	convertStars := gift.ConvertStars
+	if req.BuyerIsBot {
+		convertStars = 0
+	}
 	saved := domain.SavedStarGift{Owner: req.To, FromUserID: req.BuyerUserID, GiftID: gift.ID, RevisionID: gift.RevisionID,
-		Date: req.Date, NameHidden: req.HideName, ConvertStars: gift.ConvertStars, PrepaidUpgradeStars: upgradePrice,
+		Date: req.Date, NameHidden: req.HideName, ConvertStars: convertStars, PrepaidUpgradeStars: upgradePrice,
 		PrepaidUpgradeHash: prepayHash, Message: req.Message,
 		MessageEntities: append([]domain.MessageEntity(nil), req.MessageEntities...), Unsaved: req.RecipientUnsaved}
 	return gift, saved, balance, nil
@@ -355,7 +419,7 @@ VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, req.BuyerUserID, req.CommandKey, req.Gi
 		savedID, req.FormID, charge, balance, req.Date)
 	return err
 }
-	func (s *StarGiftLifecycleStore) loadStarGiftPurchaseReplay(ctx context.Context, req domain.StarGiftPurchaseRequest, sent domain.SendPrivateTextResult) (domain.StarGiftPurchaseResult, bool, error) {
+func (s *StarGiftLifecycleStore) loadStarGiftPurchaseReplay(ctx context.Context, req domain.StarGiftPurchaseRequest, sent domain.SendPrivateTextResult) (domain.StarGiftPurchaseResult, bool, error) {
 	var giftID, recipientID, savedID, formID, charge, balance int64
 	var recipientType string
 	err := s.db.QueryRow(ctx, `SELECT gift_id,recipient_peer_type,recipient_peer_id,saved_gift_id,form_id,charge_stars,balance_after
@@ -408,4 +472,56 @@ func starGiftPurchaseFingerprint(req domain.StarGiftPurchaseRequest) [32]byte {
 	entitiesJSON, _ := encodeMessageEntities(req.MessageEntities)
 	return sha256.Sum256([]byte(fmt.Sprintf("telesrv:star-gift-purchase:v2:%d:%s:%d:%d:%t:%t:%s:%s",
 		req.BuyerUserID, req.To.Type, req.To.ID, req.GiftID, req.IncludeUpgrade, req.HideName, req.Message, entitiesJSON)))
+}
+
+func (s *StarGiftLifecycleStore) debitStarGiftPurchase(ctx context.Context, tx pgx.Tx, req domain.StarGiftPurchaseRequest, charge int64) (domain.StarsBalance, error) {
+	if req.BuyerIsBot {
+		balance, err := debitBotStarsWallet(ctx, tx, req.BuyerUserID, charge, domain.StarsReasonBotSpend, req.To, req.Date)
+		if err != nil {
+			return domain.StarsBalance{}, err
+		}
+		// Granted is a personal-ledger concept (the starting-grant top-up); a bot
+		// wallet has no such grant, so it stays false rather than inventing one.
+		return domain.StarsBalance{UserID: req.BuyerUserID, Balance: balance}, nil
+	}
+	return s.debitLifecycleAmount(ctx, tx, req.BuyerUserID,
+		domain.StarGiftAmount{Currency: domain.StarGiftCurrencyStars, Amount: charge}, domain.StarsReasonGift,
+		req.To, req.Date, "Star gift")
+}
+
+func debitBotStarsWallet(ctx context.Context, tx pgx.Tx, botUserID, amount int64,
+	reason domain.StarsTransactionReason, peer domain.Peer, date int) (int64, error) {
+	var balance int64
+	if err := tx.QueryRow(ctx, `SELECT balance FROM bot_stars_balances WHERE bot_user_id=$1 FOR UPDATE`,
+		botUserID).Scan(&balance); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A wallet that was never credited is an empty wallet, not a broken one.
+			return 0, domain.ErrStarsInsufficient
+		}
+		return 0, err
+	}
+	if balance < amount {
+		return 0, domain.ErrStarsInsufficient
+	}
+	balance -= amount
+	if _, err := tx.Exec(ctx, `UPDATE bot_stars_balances SET balance=$2,updated_at=now() WHERE bot_user_id=$1`,
+		botUserID, balance); err != nil {
+		return 0, err
+	}
+	// actor_user_id is the bot itself: there is no separate spending principal, and
+	// the wallet CHECK requires a positive actor. peer is the gift recipient.
+	//
+	// Unlike stars_transactions, the wallet columns are NOT NULL, so an absent peer
+	// is written as the empty pair rather than NULL.
+	peerType, peerID := "", int64(0)
+	if validLifecyclePeer(peer) {
+		peerType, peerID = string(peer.Type), peer.ID
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO bot_stars_transactions
+(bot_user_id,actor_user_id,amount,reason,peer_type,peer_id,invoice_key,date)
+VALUES($1,$2,$3,$4,$5,$6,NULL,$7)`,
+		botUserID, botUserID, -amount, string(reason), peerType, peerID, date); err != nil {
+		return 0, err
+	}
+	return balance, nil
 }

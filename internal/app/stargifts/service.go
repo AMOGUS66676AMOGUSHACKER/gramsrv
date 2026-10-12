@@ -634,6 +634,14 @@ func (s *Service) IssuePurchaseForm(ctx context.Context, form domain.StarGiftPur
 	return domain.StarGiftPurchaseForm{}, domain.ErrStarGiftUnavailable
 }
 
+// SettledStarGiftPurchase checks the durable command before issuing another form.
+func (s *Service) SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error) {
+	if s == nil || s.lifecycle == nil {
+		return domain.StarGiftPurchaseResult{}, false, domain.ErrStarGiftUnavailable
+	}
+	return s.lifecycle.SettledStarGiftPurchase(ctx, req)
+}
+
 // ValidatePurchaseForm is a read-only preflight used for precise RPC errors.
 // The PostgreSQL purchase transaction repeats this validation while holding a
 // row lock; callers must not treat this preflight as the atomicity boundary.

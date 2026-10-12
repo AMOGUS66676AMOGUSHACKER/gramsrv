@@ -18,11 +18,6 @@ import (
 	"telesrv/internal/store/postgres/sqlcgen"
 )
 
-// marketListMinStars 是 маркет-листинга в долларовых Звёздах фиксированный нижний
-// порог (хардкод 125). Он не зависит ни от resell_min_stars каталога, ни от
-// FloorPrice: продавец не может выставить копию дешевле.
-const marketListMinStars int64 = 125
-
 type StarGiftLifecycleStore struct {
 	db               sqlcgen.DBTX
 	messages         *MessageStore
@@ -30,6 +25,7 @@ type StarGiftLifecycleStore struct {
 	market           domain.StarGiftMarketPolicy
 	craftDraw        func(int) (int, error)
 	crossCraft       StarGiftCrossCraftGenerator
+	crossCraftUsers  map[int64]bool
 	crossCraftChance int
 	crossCraftBlobs  StarGiftCrossCraftBlobReader
 }
@@ -124,6 +120,13 @@ func (s *StarGiftLifecycleStore) ConvertStarGift(ctx context.Context, req domain
 		if !saved.LifecycleStatus.Live() || saved.UniqueGiftID != 0 {
 			return domain.ErrStarGiftAlreadyUpgraded
 		}
+		// convert_stars 是转换资格的单一事实来源：机器人送出的礼物在购买事务里
+		// 被归零，历史遗留礼物由 0217 迁移统一归零，目录中本来就没有转换价的
+		// 礼物也归 0。为 0 即不可转换——拒绝而不是默默归档，旧客户端如果还显示
+		// 按钮，点下去会得到明确错误而不是把礼物白白抹掉。
+		if err := ensureStarGiftConvertible(ctx, tx, saved); err != nil {
+			return err
+		}
 
 		from := domain.Peer{Type: domain.PeerTypeUser, ID: saved.FromUserID}
 		amount := saved.ConvertStars
@@ -191,7 +194,7 @@ func (s *StarGiftLifecycleStore) ListResaleStarGifts(ctx context.Context, filter
 		filter.SortByPrice && filter.SortByNum || len(filter.Offset) > domain.MaxStarGiftsOffsetBytes {
 		return domain.StarGiftResalePage{}, domain.ErrStarGiftResaleUnavailable
 	}
-	conditions := []string{"u.gift_id=$1", "NOT u.burned", "u.owner_address=''"}
+	conditions := []string{"u.gift_id=$1", "NOT u.burned", "u.owner_address=''", "NOT l.suspended"}
 	args := []any{filter.GiftID}
 	nextArg := func(value any) string {
 		args = append(args, value)
@@ -318,10 +321,10 @@ func (s *StarGiftLifecycleStore) UniqueStarGiftValueInfo(ctx context.Context, un
 	err := s.db.QueryRow(ctx, `
 SELECT sg.gift_date, cr.stars, u.value_currency, u.value_amount, u.last_sale_date,
        COALESCE(CASE WHEN u.last_sale_currency='XTR' THEN u.last_sale_amount END,0),
-       COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id AND l.currency='XTR'
+       COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id AND l.currency='XTR' AND NOT l.suspended
           AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r JOIN star_gift_catalog gc ON gc.active_revision_id=r.id WHERE gc.gift_id=lu.gift_id)),0),
        COALESCE((SELECT AVG(sa.amount)::bigint FROM star_gift_sales sa JOIN unique_star_gifts su ON su.id=sa.unique_gift_id WHERE su.gift_id=u.gift_id AND sa.currency='XTR'),0),
-       (SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id)
+       (SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts lu ON lu.id=l.unique_gift_id WHERE lu.gift_id=u.gift_id AND NOT l.suspended)
 FROM unique_star_gifts u
 JOIN peer_star_gifts sg ON sg.id=u.source_saved_gift_id
 JOIN star_gift_catalog_revisions cr ON cr.id=sg.catalog_revision_id
@@ -379,14 +382,30 @@ func (s *StarGiftLifecycleStore) SetStarGiftListing(ctx context.Context, req dom
 				return err
 			}
 		} else {
+			if saved.Owner.Type == domain.PeerTypeUser {
+				if err := rejectFrozenStarGiftSeller(ctx, tx, saved.Owner.ID); err != nil {
+					return err
+				}
+			}
 			if unique.ResaleTonOnly && req.Amount.Currency != domain.StarGiftCurrencyTON {
 				return domain.ErrStarGiftResaleUnavailable
 			}
-			// Маркет-листинг в долларовых Звёздах нельзя выставить дешевле
-			// фиксированного FloorPrice-порога (хардкод), независимо от
-			// каталога/FloorPrice.
-			if req.Amount.Currency == domain.StarGiftCurrencyStars && req.Amount.Amount < marketListMinStars {
-				return domain.ErrStarGiftResaleUnavailable
+			var minimum int64
+			if req.Amount.Currency == domain.StarGiftCurrencyStars {
+				// The enforced floor is the cheapest live listing for this gift type,
+				// excluding troll listings priced far above the gift's base price.
+				// Computed from listings rather than the projected catalog column so
+				// a stale seed can never lock resale below a sane price.
+				if err := tx.QueryRow(ctx, `SELECT COALESCE((
+  SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id
+  WHERE u.gift_id=$1 AND l.currency='XTR' AND NOT l.suspended
+    AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r JOIN star_gift_catalog c ON c.active_revision_id=r.id WHERE c.gift_id=$1)
+ ),0)`, unique.GiftID, domain.StarGiftResaleFloorMultiple).Scan(&minimum); err != nil {
+					return err
+				}
+				if req.Amount.Amount < minimum {
+					return domain.ErrStarGiftResaleUnavailable
+				}
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO star_gift_listings(unique_gift_id,seller_peer_type,seller_peer_id,currency,amount,listed_at,updated_at)
 VALUES($1,$2,$3,$4,$5,$6,$6)
@@ -416,26 +435,22 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 		req.To == req.Ref.Owner || req.ChargeStars < 0 || req.Date <= 0 || strings.TrimSpace(req.CommandKey) == "" {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
 	}
-	// A tombstone cannot receive anything. Transfer is the one gift write that
-	// resolved its target with no lifecycle check at all, so an NFT gift could be
-	// parked on a deleted account forever. FOR SHARE excludes the concurrent
-	// deletion transaction's FOR UPDATE on the same users row.
-	if req.To.Type == domain.PeerTypeUser {
-		var activeRecipient bool
-		if err := s.db.QueryRow(ctx, `SELECT deleted_at IS NULL FROM users WHERE id=$1 FOR SHARE`, req.To.ID).Scan(&activeRecipient); err != nil {
+	// A user message reference identifies one ownership occurrence even when a
+	// gift makes several round trips during the same second. Retries carry the
+	// original reference and therefore keep their original command key.
+	if req.Ref.Owner.Type == domain.PeerTypeUser {
+		req.CommandKey = fmt.Sprintf("%s:ref:%d:%d", strings.TrimSpace(req.CommandKey), req.Ref.Owner.ID, req.Ref.MsgID)
+	} else {
+		saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref)
+		if err != nil {
 			return domain.StarGiftTransferResult{}, err
 		}
-		if !activeRecipient {
-			return domain.StarGiftTransferResult{}, domain.ErrStarGiftTransferUnavailable
+		if found {
+			req.CommandKey, err = s.resolveEpochCommandKey(ctx, req.ActorUserID, req.CommandKey, saved)
+			if err != nil {
+				return domain.StarGiftTransferResult{}, err
+			}
 		}
-	}
-	// Идемпотентный ключ привязываем к эпохе владения, иначе повторная передача
-	// того же коллекционного тому же получателю (подарок уже уходил и возвращался)
-	// выглядит как реплей прошлой карточки и молча ничего не делает. Смотрим
-	// текущую строку до отправки: random_id сообщения выводится из ключа, а
-	// пересчитать его уже внутри before слишком поздно для проверки дубликата.
-	if saved, found, err := NewStarGiftStore(s.db).GetByRef(ctx, req.Ref); err == nil && found {
-		req.CommandKey = s.resolveEpochCommandKey(ctx, req.ActorUserID, req.CommandKey, saved)
 	}
 	if req.To.Type != domain.PeerTypeUser {
 		return s.transferStarGiftWithoutPrivateMessage(ctx, req)
@@ -452,6 +467,15 @@ func (s *StarGiftLifecycleStore) TransferStarGift(ctx context.Context, req domai
 	var sourceSaved domain.SavedStarGift
 	hooks := privateSendTxHooks{
 		before: func(ctx context.Context, tx pgx.Tx, send *domain.SendPrivateTextRequest) error {
+			// Keep the recipient row lock until ownership and the message both commit.
+			var active bool
+			if err := tx.QueryRow(ctx, `SELECT deleted_at IS NULL FROM users WHERE id=$1 FOR SHARE`, req.To.ID).Scan(&active); err != nil {
+				return err
+			}
+			if !active {
+				return domain.ErrStarGiftTransferUnavailable
+			}
+
 			saved, unique, err := lockTransferableStarGift(ctx, tx, req.ActorUserID, req.Ref, req.Date)
 			if err != nil {
 				return err
@@ -536,6 +560,21 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 	}
 	seller := unique.Owner
+	// Как и при переводе: ключ покупки привязываем к эпохе владения, иначе
+	// покупка того же коллекционного после круга туда-обратно выглядит как
+	// реплей предыдущей сделки (та же карточка, тот же random_id) и проходит
+	// без перехода владения. Считаем до проверки реплея, чтобы она и запись
+	// команды использовали один и тот же ключ.
+	current, currentFound, err := savedStarGiftByUniqueID(ctx, s.db, unique.ID)
+	if err != nil {
+		return domain.StarGiftTransferResult{}, err
+	}
+	if currentFound {
+		req.CommandKey, err = s.resolveEpochCommandKey(ctx, req.BuyerUserID, req.CommandKey, current)
+		if err != nil {
+			return domain.StarGiftTransferResult{}, err
+		}
+	}
 	var replayUniqueID, replayFromID, replayToID, replayAmount int64
 	var replayFromType, replayToType, replayCurrency string
 	replayErr := s.db.QueryRow(ctx, `SELECT t.unique_gift_id,t.from_peer_type,t.from_peer_id,t.to_peer_type,t.to_peer_id,
@@ -554,10 +593,12 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 	} else if !validLifecyclePeer(unique.Owner) || unique.Owner == req.To {
 		return domain.StarGiftTransferResult{}, domain.ErrStarGiftResaleUnavailable
 	}
-	messageSenderID := domain.OfficialSystemUserID
-	if seller.Type == domain.PeerTypeUser {
-		messageSenderID = seller.ID
-	}
+	// Маркет меняет только владельца: подарок «отправляет» покупатель, а не
+	// продавец. Отправляя сервисное сообщение от продавца, получатель видел
+	// «продавец отправил вам подарок» вместо «покупатель отправил вам подарок».
+	// Остальные пути (покупка каталога, перевод, аукцион, оффер) уже отправляют
+	// сообщение от того, кто распоряжался подарком.
+	messageSenderID := req.BuyerUserID
 	messageRecipientID := req.BuyerUserID
 	if req.To.Type == domain.PeerTypeUser {
 		messageRecipientID = req.To.ID
@@ -590,7 +631,7 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 			 l.seller_peer_type='user' AND EXISTS(SELECT 1 FROM account_restrictions r WHERE r.user_id=l.seller_peer_id AND r.frozen)
 			 FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id
 			 WHERE lower(u.slug)=lower($1) AND NOT l.suspended
-			 AND NOT EXISTS (SELECT 1 FROM users su WHERE su.id=l.seller_peer_id AND su.deleted_at IS NOT NULL)
+			 AND NOT EXISTS (SELECT 1 FROM users su WHERE l.seller_peer_type='user' AND su.id=l.seller_peer_id AND su.deleted_at IS NOT NULL)
 			 FOR UPDATE OF l,u`, strings.TrimSpace(req.Slug)).Scan(
 				&listingCurrency, &listingAmount, &sellerType, &sellerID, &uniqueID, &sellerFrozen); err != nil {
 				if errors.Is(err, pgx.ErrNoRows) {
@@ -598,7 +639,7 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 				}
 				return err
 			}
-			if sellerType != string(seller.Type) || sellerID != seller.ID ||
+			if sellerFrozen || sellerType != string(seller.Type) || sellerID != seller.ID ||
 				listingCurrency != string(req.Amount.Currency) || listingAmount != req.Amount.Amount {
 				return domain.ErrStarGiftResaleUnavailable
 			}
@@ -655,6 +696,10 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 			msgID, savedID := sent.RecipientMessage.ID, int64(0)
 			if req.To.Type == domain.PeerTypeChannel {
 				msgID, savedID = 0, result.Saved.ID
+			} else if msgID <= 0 {
+				// Покупка себе: сервисное сообщение лежит только в Saved Messages
+				// покупателя, копии в его же входящем боксе нет.
+				msgID = sent.SenderMessage.ID
 			}
 			if req.To.Type == domain.PeerTypeUser && msgID <= 0 {
 				return domain.ErrStarGiftResaleUnavailable
@@ -672,6 +717,11 @@ func (s *StarGiftLifecycleStore) PurchaseResaleStarGift(ctx context.Context, req
 				}
 			} else {
 				notificationMessageID := sent.RecipientMessage.ID
+				if notificationMessageID <= 0 {
+					// Подарок куплен в канал: уведомление лежит в боксе покупателя,
+					// который совпадает с боксом отправителя.
+					notificationMessageID = sent.SenderMessage.ID
+				}
 				if notificationMessageID <= 0 {
 					return fmt.Errorf("channel resale notification missing buyer box")
 				}
@@ -1481,10 +1531,10 @@ func savedStarGiftByUniqueID(ctx context.Context, db sqlcgen.DBTX, uniqueID int6
 	return saved, err == nil, err
 }
 
-func updateStarGiftResaleProjection(ctx context.Context, tx pgx.Tx, giftID int64) error {
-	_, err := tx.Exec(ctx, `UPDATE star_gift_catalog c SET
- availability_resale=(SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id),
- resell_min_stars=COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id AND l.currency='XTR'
+func updateStarGiftResaleProjection(ctx context.Context, db sqlcgen.DBTX, giftID int64) error {
+	_, err := db.Exec(ctx, `UPDATE star_gift_catalog c SET
+ availability_resale=(SELECT COUNT(*) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id AND NOT l.suspended),
+ resell_min_stars=COALESCE((SELECT MIN(l.amount) FROM star_gift_listings l JOIN unique_star_gifts u ON u.id=l.unique_gift_id WHERE u.gift_id=c.gift_id AND l.currency='XTR' AND NOT l.suspended
    AND l.amount <= $2 * (SELECT r.stars FROM star_gift_catalog_revisions r WHERE r.id=c.active_revision_id)),0),
  updated_at=now() WHERE c.gift_id=$1`, giftID, domain.StarGiftResaleFloorMultiple)
 	return err
@@ -1883,20 +1933,26 @@ func (s *StarGiftLifecycleStore) resolveEpochCommandKey(
 	actorUserID int64,
 	base string,
 	saved domain.SavedStarGift,
-) string {
+) (string, error) {
 	base = strings.TrimSpace(base)
 	if base == "" || saved.Date <= 0 || actorUserID <= 0 || s == nil || s.db == nil {
-		return base
+		return base, nil
 	}
 	var createdAt int
 	err := s.db.QueryRow(ctx, `SELECT created_at FROM star_gift_transfer_commands
 WHERE actor_user_id=$1 AND command_key=$2`, actorUserID, base).Scan(&createdAt)
-	if err != nil || createdAt == saved.Date {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return base, nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if createdAt == saved.Date {
 		// Either the key is unused, or it belongs to this very epoch: retries
 		// of an in-flight or finished operation must keep replaying.
-		return base
+		return base, nil
 	}
-	return base + ":e" + strconv.FormatInt(int64(saved.Date), 10)
+	return base + ":e" + strconv.FormatInt(int64(saved.Date), 10), nil
 }
 
 func lifecycleCommandRandomID(parts ...any) int64 {
@@ -1906,16 +1962,6 @@ func lifecycleCommandRandomID(parts ...any) int64 {
 		return 1
 	}
 	return id
-}
-
-// SettledStarGiftPurchase retrieves a previously completed bot gift purchase by command key.
-// It returns (result, true, nil) when the key has a settled purchase, (zero, false, nil)
-// when the key is unused or belongs to an in-flight purchase, and (zero, false, err) on errors.
-func (s *StarGiftLifecycleStore) SettledStarGiftPurchase(ctx context.Context, req domain.StarGiftPurchaseRequest) (domain.StarGiftPurchaseResult, bool, error) {
-	// This is a read-only replay check for bot-initiated gifts. The actual purchase
-	// logic is in PurchaseStarGift; this method only checks whether a given command_key
-	// already produced a settled gift that can be returned without re-executing.
-	return domain.StarGiftPurchaseResult{}, false, nil
 }
 
 func validLifecyclePeer(peer domain.Peer) bool {
@@ -1929,3 +1975,32 @@ func sortedUniqueInt64(values []int64) []int64 {
 }
 
 var _ store.StarGiftLifecycleStore = (*StarGiftLifecycleStore)(nil)
+
+// WithStarGiftCrossCraftUsers enables cross-collection generation only for explicitly configured accounts.
+func WithStarGiftCrossCraftUsers(ids []int64) StarGiftLifecycleOption {
+	return func(s *StarGiftLifecycleStore) {
+		s.crossCraftUsers = make(map[int64]bool, len(ids))
+		for _, id := range ids {
+			if id > 0 {
+				s.crossCraftUsers[id] = true
+			}
+		}
+	}
+}
+
+func ensureStarGiftConvertible(ctx context.Context, tx pgx.Tx, saved domain.SavedStarGift) error {
+	if saved.ConvertStars <= 0 {
+		return domain.ErrStarGiftNotConvertible
+	}
+	if saved.FromUserID > 0 {
+		var isBot bool
+		if err := tx.QueryRow(ctx, `SELECT sender.is_bot FROM users sender WHERE sender.id=$1`,
+			saved.FromUserID).Scan(&isBot); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if isBot {
+			return domain.ErrStarGiftNotConvertible
+		}
+	}
+	return nil
+}

@@ -2,6 +2,8 @@ package rpc
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"sort"
 	"strings"
@@ -28,10 +30,6 @@ func (r *Router) onMessagesSendMessage(ctx context.Context, req *tg.MessagesSend
 		sendErr = scheduleDateInvalidErr()
 		return nil, sendErr
 	}
-	if err := sendMessageUnsupportedOptionErr(req); err != nil {
-		sendErr = err
-		return nil, sendErr
-	}
 	if req.QuickReplyShortcut != nil {
 		if utf8.RuneCountInString(req.Message) > maxSendMessageTextLength {
 			sendErr = messageTooLongErr()
@@ -49,6 +47,11 @@ func (r *Router) onMessagesSendMessage(ctx context.Context, req *tg.MessagesSend
 		return updates, nil
 	}
 
+	if err := sendMessageUnsupportedOptionErr(req); err != nil {
+		sendErr = err
+		return nil, sendErr
+	}
+
 	if utf8.RuneCountInString(req.Message) > maxSendMessageTextLength {
 		var updates tg.UpdatesClass
 		updates, duplicate, sendErr = r.sendSplitMessage(ctx, req)
@@ -60,63 +63,76 @@ func (r *Router) onMessagesSendMessage(ctx context.Context, req *tg.MessagesSend
 	return updates, sendErr
 }
 
+// Bound the number of independent writes one RPC may admit. A failed suffix is
+// resumed with stable ids; already committed chunks retain their original PTS.
+const maxSendMessageChunks = 16
+
+func splitMessageRandomID(parent int64, index int) int64 {
+	if index == 0 {
+		return parent
+	}
+	var key [16]byte
+	binary.LittleEndian.PutUint64(key[:8], uint64(parent))
+	binary.LittleEndian.PutUint64(key[8:], uint64(index))
+	sum := sha256.Sum256(append([]byte("telesrv:split-message:v1:"), key[:]...))
+	id := int64(binary.LittleEndian.Uint64(sum[:8]))
+	if id == 0 || id == parent {
+		id = parent ^ int64(index) ^ (1 << 62)
+	}
+	if id == 0 {
+		id = -1
+	}
+	return id
+}
+
 func (r *Router) sendSplitMessage(ctx context.Context, req *tg.MessagesSendMessageRequest) (tg.UpdatesClass, bool, error) {
+	if !utf8.ValidString(req.Message) || utf8.RuneCountInString(req.Message) > maxSendMessageTextLength*maxSendMessageChunks {
+		return nil, false, messageTooLongErr()
+	}
+	// Rich messages and paid/suggested posts have one aggregate, price or approval
+	// boundary. Splitting those would change the request's economic semantics.
+	_, hasSuggestedPost := req.GetSuggestedPost()
+	if req.RichMessage != nil || req.AllowPaidStars != 0 || hasSuggestedPost {
+		return nil, false, messageTooLongErr()
+	}
+	if len(req.Entities) > maxMessageEntityCount {
+		return nil, false, entitiesTooLongErr()
+	}
+	converted := domainMessageEntities(req.Entities)
+	if len(converted) != len(req.Entities) || !validEphemeralEntityBounds(req.Message, converted) {
+		return nil, false, entityBoundsInvalidErr()
+	}
+	fingerprint, err := sendMessageIdempotencyFingerprint(req)
+	if err != nil {
+		return nil, false, entityBoundsInvalidErr()
+	}
 	chunks := splitMessageRunes(req.Message, maxSendMessageTextLength)
-	if len(chunks) <= 1 {
-		return r.sendSingleSendMessage(ctx, req)
-	}
-
-	var combinedUpdates *tg.Updates
-	var anyDuplicate bool
-
-	chunkUtf16Lens := make([]int, len(chunks))
+	results := make([]tg.UpdatesClass, 0, len(chunks))
+	allDuplicate := true
+	offset := 0
 	for i, chunk := range chunks {
-		chunkUtf16Lens[i] = utf16CodeUnitLen(chunk)
-	}
-
-	currentUtf16Offset := 0
-	for i, chunk := range chunks {
-		chunkStartUtf16 := currentUtf16Offset
-		chunkEndUtf16 := currentUtf16Offset + chunkUtf16Lens[i]
-		currentUtf16Offset = chunkEndUtf16
-
-		chunkEntities := sliceTGEntitiesForChunk(req.Entities, chunkStartUtf16, chunkEndUtf16)
-
-		chunkReq := *req
-		chunkReq.Message = chunk
-		chunkReq.Entities = chunkEntities
-
-		if i == 0 {
-			chunkReq.RandomID = req.RandomID
-		} else {
-			chunkReq.RandomID = randomNonZeroInt64()
+		end := offset + utf16CodeUnitLen(chunk)
+		part := *req
+		part.Flags = 0
+		part.Message = chunk
+		part.Entities = sliceTGEntitiesForChunk(req.Entities, offset, end)
+		part.RandomID = splitMessageRandomID(req.RandomID, i)
+		if i != len(chunks)-1 {
+			part.ClearDraft = false
+			part.ReplyMarkup = nil
+			part.Effect = 0
 		}
-
-		if i == len(chunks)-1 {
-			chunkReq.ClearDraft = req.ClearDraft
-			chunkReq.ReplyMarkup = req.ReplyMarkup
-			chunkReq.Effect = req.Effect
-		} else {
-			chunkReq.ClearDraft = false
-			chunkReq.ReplyMarkup = nil
-			chunkReq.Effect = 0
-		}
-
-		upd, dup, err := r.sendSingleSendMessage(ctx, &chunkReq)
+		// Every fragment is bound to the entire original intent. Reusing the parent
+		// random_id with a different suffix must fail even when its first chunk matches.
+		result, duplicate, err := r.sendSingleSendMessage(ctx, &part, fingerprint)
 		if err != nil {
 			return nil, false, err
 		}
-		if dup {
-			return upd, true, nil
-		}
-
-		combinedUpdates = mergeMessageUpdates(combinedUpdates, upd)
+		allDuplicate = allDuplicate && duplicate
+		results = append(results, result)
+		offset = end
 	}
-
-	if combinedUpdates == nil {
-		return &tg.Updates{}, anyDuplicate, nil
-	}
-	return combinedUpdates, anyDuplicate, nil
+	return combineSendUpdates(results), allDuplicate, nil
 }
 
 func splitMessageRunes(text string, limit int) []string {
@@ -306,92 +322,7 @@ func cloneEntityWithBounds(entity tg.MessageEntityClass, offset, length int) tg.
 	}
 }
 
-func mergeMessageUpdates(base *tg.Updates, next tg.UpdatesClass) *tg.Updates {
-	if next == nil {
-		return base
-	}
-	if base == nil {
-		base = &tg.Updates{}
-	}
-	switch u := next.(type) {
-	case *tg.Updates:
-		base.Updates = append(base.Updates, u.Updates...)
-		base.Users = append(base.Users, u.Users...)
-		base.Chats = append(base.Chats, u.Chats...)
-		if u.Date > base.Date {
-			base.Date = u.Date
-		}
-		if u.Seq > base.Seq {
-			base.Seq = u.Seq
-		}
-	case *tg.UpdatesCombined:
-		base.Updates = append(base.Updates, u.Updates...)
-		base.Users = append(base.Users, u.Users...)
-		base.Chats = append(base.Chats, u.Chats...)
-		if u.Date > base.Date {
-			base.Date = u.Date
-		}
-		if u.Seq > base.Seq {
-			base.Seq = u.Seq
-		}
-	case *tg.UpdateShort:
-		base.Updates = append(base.Updates, u.Update)
-		if u.Date > base.Date {
-			base.Date = u.Date
-		}
-	case *tg.UpdateShortSentMessage:
-		base.Updates = append(base.Updates, &tg.UpdateNewMessage{
-			Pts:      u.Pts,
-			PtsCount: u.PtsCount,
-		})
-		if u.Date > base.Date {
-			base.Date = u.Date
-		}
-	}
-	base.Users = deduplicateUsers(base.Users)
-	base.Chats = deduplicateChats(base.Chats)
-	return base
-}
-
-func deduplicateUsers(users []tg.UserClass) []tg.UserClass {
-	if len(users) <= 1 {
-		return users
-	}
-	seen := make(map[int64]struct{}, len(users))
-	out := make([]tg.UserClass, 0, len(users))
-	for _, u := range users {
-		if u == nil {
-			continue
-		}
-		id := u.GetID()
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			out = append(out, u)
-		}
-	}
-	return out
-}
-
-func deduplicateChats(chats []tg.ChatClass) []tg.ChatClass {
-	if len(chats) <= 1 {
-		return chats
-	}
-	seen := make(map[int64]struct{}, len(chats))
-	out := make([]tg.ChatClass, 0, len(chats))
-	for _, c := range chats {
-		if c == nil {
-			continue
-		}
-		id := c.GetID()
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-func (r *Router) sendSingleSendMessage(ctx context.Context, req *tg.MessagesSendMessageRequest) (tg.UpdatesClass, bool, error) {
+func (r *Router) sendSingleSendMessage(ctx context.Context, req *tg.MessagesSendMessageRequest, splitFingerprint ...[]byte) (tg.UpdatesClass, bool, error) {
 	if utf8.RuneCountInString(req.Message) > maxSendMessageTextLength {
 		return nil, false, messageTooLongErr()
 	}
@@ -419,6 +350,9 @@ func (r *Router) sendSingleSendMessage(ctx context.Context, req *tg.MessagesSend
 		return nil, false, peerIDInvalidErr()
 	}
 	idempotencyFingerprint, err := sendMessageIdempotencyFingerprint(req)
+	if len(splitFingerprint) != 0 {
+		idempotencyFingerprint = splitFingerprint[0]
+	}
 	if err != nil {
 		return nil, false, internalErr()
 	}

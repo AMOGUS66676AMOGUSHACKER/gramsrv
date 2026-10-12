@@ -564,10 +564,10 @@ JOIN star_gift_catalog_revisions r ON r.id = c.active_revision_id`
 		conditions = append(conditions, "p.unique_gift_id IS NOT NULL")
 	}
 	upgradable := `(p.unique_gift_id IS NULL AND acr.id IS NOT NULL AND acr.upgrade_stars > 0 AND acr.issued < acr.supply_total)`
-	if filter.ExcludeUpgradable {
+	if filter.ExcludeUpgradable && !filter.ExcludeUnupgradable {
 		conditions = append(conditions, "NOT "+upgradable)
 	}
-	if filter.ExcludeUnupgradable {
+	if filter.ExcludeUnupgradable && !filter.ExcludeUpgradable {
 		conditions = append(conditions, upgradable)
 	}
 	if filter.CollectionID > 0 {
@@ -606,16 +606,16 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 		}
 	} else if cursor, ok := domain.DecodeSavedStarGiftListCursor(offset); ok {
 		if profileOrder && cursor.PinnedOrder > 0 {
-			args = append(args, cursor.PinnedOrder, cursor.ID)
+			args = append(args, cursor.PinnedOrder, cursor.Date, cursor.ID)
 			where += fmt.Sprintf(` AND (
     p.pinned_order = 0
-    OR p.pinned_order > $%d
-    OR (p.pinned_order = $%d AND p.id < $%d)
-)`, len(args)-1, len(args)-1, len(args))
+    OR p.pinned_order > $%[1]d
+    OR (p.pinned_order = $%[1]d AND (p.gift_date, p.id) < ($%[2]d, $%[3]d))
+)`, len(args)-2, len(args)-1, len(args))
 		} else {
-			args = append(args, cursor.ID)
+			args = append(args, cursor.Date, cursor.ID)
 			if profileOrder {
-				where += fmt.Sprintf(" AND p.pinned_order = 0 AND p.id < $%d", len(args))
+				where += fmt.Sprintf(" AND p.pinned_order = 0 AND (p.gift_date, p.id) < ($%d, $%d)", len(args)-1, len(args))
 			} else {
 				where += fmt.Sprintf(" AND p.id < $%d", len(args))
 			}
@@ -626,7 +626,7 @@ WHERE ci.saved_gift_id = p.id AND ci.collection_id = $%d
 	case filter.SortByValue:
 		orderBy = "ORDER BY " + priceExpr + " DESC, p.id DESC"
 	case profileOrder:
-		orderBy = "ORDER BY (p.pinned_order = 0), p.pinned_order, p.id DESC"
+		orderBy = "ORDER BY (p.pinned_order = 0), p.pinned_order, p.gift_date DESC, p.id DESC"
 	}
 	args = append(args, limit+1)
 	limitPlaceholder := len(args)
@@ -685,7 +685,7 @@ LIMIT $`+fmt.Sprint(limitPlaceholder), args...)
 			if profileOrder {
 				pinnedOrder = last.PinnedOrder
 			}
-			page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.ID)
+			page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.Date, last.ID)
 		}
 	}
 	page.Gifts = gifts
@@ -910,7 +910,7 @@ func (s *StarGiftStore) CountByOwner(ctx context.Context, owner domain.Peer) (in
 	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)
 FROM peer_star_gifts p
 LEFT JOIN unique_star_gifts u ON u.id=p.unique_gift_id
-WHERE (p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active' AND NOT p.unsaved)
+WHERE (p.owner_peer_type=$1 AND p.owner_peer_id=$2 AND p.lifecycle_status='active')
    OR (p.lifecycle_status='exported' AND u.owner_address<>'' AND NOT u.burned
        AND u.host_peer_type=$1 AND u.host_peer_id=$2)`, string(owner.Type), owner.ID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count star gifts: %w", err)

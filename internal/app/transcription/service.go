@@ -48,13 +48,14 @@ type jobRequest struct {
 }
 
 type Service struct {
-	store    store.TranscriptionStore
-	files    FileSource
-	url      string
-	client   *http.Client
-	log      *zap.Logger
-	mu       sync.Mutex
-	inflight map[int64]struct{}
+	store     store.TranscriptionStore
+	files     FileSource
+	url       string
+	client    *http.Client
+	log       *zap.Logger
+	requestMu sync.Mutex
+	mu        sync.Mutex
+	inflight  map[int64][]jobRequest
 	// completed 在后台任务写完 DB 后推 updateTranscribedAudio；由 main 在 router
 	// 创建后注入，避免 app 层反向依赖 rpc。
 	completed func(ctx context.Context, userID int64, peer domain.Peer, msgID int, transcriptionID int64, text string)
@@ -73,7 +74,7 @@ func NewService(
 		url:      strings.TrimRight(strings.TrimSpace(url), "/"),
 		client:   &http.Client{Timeout: timeout},
 		log:      log,
-		inflight: map[int64]struct{}{},
+		inflight: map[int64][]jobRequest{},
 	}
 }
 
@@ -94,6 +95,8 @@ func (s *Service) Transcribe(
 	if s == nil || s.url == "" {
 		return domain.TranscriptionResult{}, ErrUnavailable
 	}
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
 	if document.ID == 0 {
 		return domain.TranscriptionResult{}, ErrDocument
 	}
@@ -155,32 +158,49 @@ func (s *Service) Transcribe(
 			return domain.TranscriptionResult{}, err
 		}
 	}
-	s.startJob(document, job)
+	if !s.startJob(document, job) {
+		return domain.TranscriptionResult{}, ErrUnavailable
+	}
 	return domain.TranscriptionResult{TranscriptionID: job.transcriptionID, Pending: true}, nil
 }
 
-func (s *Service) startJob(document domain.Document, job jobRequest) {
+const maxConcurrentTranscriptions = 4
+const maxTranscriptionSubscribers = 128
+
+func (s *Service) startJob(document domain.Document, job jobRequest) bool {
 	s.mu.Lock()
-	if _, busy := s.inflight[job.documentID]; busy {
-		s.mu.Unlock()
-		return
-	}
-	s.inflight[job.documentID] = struct{}{}
-	s.mu.Unlock()
-	go func() {
-		defer func() {
-			s.mu.Lock()
-			delete(s.inflight, job.documentID)
+	if subscribers, busy := s.inflight[job.documentID]; busy {
+		for _, subscriber := range subscribers {
+			if subscriber == job {
+				s.mu.Unlock()
+				return true
+			}
+		}
+		if len(subscribers) >= maxTranscriptionSubscribers {
 			s.mu.Unlock()
-		}()
-		s.run(context.Background(), document, job)
-	}()
+			return false
+		}
+		s.inflight[job.documentID] = append(subscribers, job)
+		s.mu.Unlock()
+		return true
+	}
+	if len(s.inflight) >= maxConcurrentTranscriptions {
+		s.mu.Unlock()
+		return false
+	}
+	s.inflight[job.documentID] = []jobRequest{job}
+	s.mu.Unlock()
+	go s.run(context.Background(), document, job)
+	return true
 }
 
 func (s *Service) run(parent context.Context, document domain.Document, job jobRequest) {
 	ctx, cancel := context.WithTimeout(parent, s.client.Timeout)
 	defer cancel()
 	text, err := s.transcribeDocument(ctx, document.ID)
+	s.requestMu.Lock()
+	defer s.requestMu.Unlock()
+	defer func() { s.mu.Lock(); delete(s.inflight, job.documentID); s.mu.Unlock() }()
 	dbCtx, cancelDB := context.WithTimeout(context.Background(), dbWriteTimeout)
 	defer cancelDB()
 	if err != nil {
@@ -199,10 +219,16 @@ func (s *Service) run(parent context.Context, document domain.Document, job jobR
 	}
 	s.mu.Lock()
 	completed := s.completed
+	subscribers := append([]jobRequest(nil), s.inflight[job.documentID]...)
 	s.mu.Unlock()
-	if completed != nil && job.userID != 0 && job.msgID > 0 {
-		completed(dbCtx, job.userID, job.peer, job.msgID, job.transcriptionID, text)
+	if completed != nil {
+		for _, subscriber := range subscribers {
+			if subscriber.userID != 0 && subscriber.msgID > 0 {
+				completed(dbCtx, subscriber.userID, subscriber.peer, subscriber.msgID, job.transcriptionID, text)
+			}
+		}
 	}
+
 }
 
 func (s *Service) transcribeDocument(ctx context.Context, documentID int64) (string, error) {
@@ -244,7 +270,7 @@ func (s *Service) transcribeDocument(ctx context.Context, documentID int64) (str
 		return "", err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("asr responded %d: %s", resp.StatusCode, strings.TrimSpace(string(payload)))
+		return "", fmt.Errorf("asr responded %d", resp.StatusCode)
 	}
 	var parsed struct {
 		Text string `json:"text"`

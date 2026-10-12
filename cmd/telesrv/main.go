@@ -1369,6 +1369,7 @@ func run(logger *zap.Logger) error {
 			TONProceedsPermille:   cfg.StarGiftTONProceedsPermille,
 		}), postgres.WithStarGiftCrossCraftGenerator(newCrossCraftGenerator(cfg, blobBackend, logger)),
 		postgres.WithStarGiftCrossCraftChance(cfg.StarGiftCraftChancePermille),
+		postgres.WithStarGiftCrossCraftUsers(cfg.StarGiftCrossCraftUserIDs),
 		postgres.WithStarGiftCrossCraftBlobReader(blobBackend))
 	var starGiftWithdrawalOption stargifts.Option
 	if cfg.CustomFragmentEnabled {
@@ -1768,7 +1769,7 @@ func run(logger *zap.Logger) error {
 		// failover 链是有序的,启动时打出来,排查"为什么这条会话显示 Unknown"时能直接
 		// 看出当时主力是哪个。
 		logger.Info("会话地理归属已启用",
-			zap.Strings("backends", cfg.GeoIPEndpoints))
+			zap.Strings("backends", geoip.EndpointNames(cfg.GeoIPEndpoints)))
 	} else {
 		logger.Info("会话地理归属未启用：account.getAuthorizations 继续回传 Unknown 占位文案")
 	}

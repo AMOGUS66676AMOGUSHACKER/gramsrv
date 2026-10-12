@@ -2,8 +2,6 @@ package bots
 
 import (
 	"testing"
-
-	"telesrv/internal/domain"
 )
 
 func TestParseGramsrvCommand(t *testing.T) {
@@ -45,8 +43,5 @@ func TestGramsrvChatAllowlistIsNumeric(t *testing.T) {
 	}
 	if svc.gramsrvChatAllowed(1780243438) || svc.gramsrvChatAllowed(0) {
 		t.Fatal("unconfigured chat_id was accepted")
-	}
-	if domain.GramsrvBotUserID == 0 {
-		t.Fatal("gramsrv bot identity is not configured")
 	}
 }

@@ -39,8 +39,8 @@ func NewStarGiftStore() *StarGiftStore {
 		enabled: make(map[int64]bool), sortOrder: make(map[int64]int), animations: make(map[int64][]byte),
 		collectibles: make(map[int64]domain.StarGiftCollectibleRevision),
 		uniqueByID:   make(map[int64]domain.UniqueStarGift), uniqueBySlug: make(map[string]int64),
-		collections:  make(map[domain.Peer][]domain.StarGiftCollection),
-		listings:     make(map[int64][]domain.StarGiftAmount),
+		collections:     make(map[domain.Peer][]domain.StarGiftCollection),
+		listings:        make(map[int64][]domain.StarGiftAmount),
 		displaySettings: make(map[int]domain.StarGiftCollectionDisplaySettings),
 	}
 }
@@ -448,10 +448,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 				upgradable = gift.UpgradeStars > 0 && gift.UpgradeIssued < gift.UpgradeTotal
 			}
 		}
-		if filter.ExcludeUpgradable && upgradable {
+		if filter.ExcludeUpgradable && !filter.ExcludeUnupgradable && upgradable {
 			continue
 		}
-		if filter.ExcludeUnupgradable && !upgradable {
+		if filter.ExcludeUnupgradable && !filter.ExcludeUpgradable && !upgradable {
 			continue
 		}
 		// 内存存储只产出 lifecycle_status=active 的行，hosted 行由 SQL 侧的
@@ -510,6 +510,9 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 				return matched[i].PinnedOrder < matched[j].PinnedOrder
 			}
 		}
+		if profileOrder && matched[i].Date != matched[j].Date {
+			return matched[i].Date > matched[j].Date
+		}
 		return matched[i].ID > matched[j].ID
 	})
 	page := domain.SavedStarGiftPage{Count: len(matched)}
@@ -526,10 +529,10 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 			if profileOrder {
 				if cursor.PinnedOrder > 0 {
 					if g.PinnedOrder > 0 && (g.PinnedOrder < cursor.PinnedOrder ||
-						g.PinnedOrder == cursor.PinnedOrder && g.ID >= cursor.ID) {
+						g.PinnedOrder == cursor.PinnedOrder && atOrBeforeProfileCursor(cursor, g)) {
 						continue
 					}
-				} else if g.PinnedOrder > 0 || g.ID >= cursor.ID {
+				} else if g.PinnedOrder > 0 || atOrBeforeProfileCursor(cursor, g) {
 					continue
 				}
 			} else if g.ID >= cursor.ID {
@@ -551,7 +554,7 @@ func (s *StarGiftStore) ListByOwnerFiltered(_ context.Context, filter domain.Sav
 			if profileOrder {
 				pinnedOrder = last.PinnedOrder
 			}
-			page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.ID)
+			page.NextOffset = domain.EncodeSavedStarGiftListCursor(pinnedOrder, last.Date, last.ID)
 		}
 	}
 	page.Gifts = out
@@ -615,7 +618,7 @@ func (s *StarGiftStore) CountByOwner(_ context.Context, owner domain.Peer) (int,
 	defer s.mu.Unlock()
 	n := 0
 	for _, g := range s.gifts {
-		if g.Owner == owner && g.LifecycleStatus.Live() && !g.Unsaved {
+		if g.Owner == owner && g.LifecycleStatus.Live() {
 			n++
 		}
 	}
@@ -1017,4 +1020,8 @@ func (s *StarGiftStore) savedStarGiftMatchesRef(g domain.SavedStarGift, ref doma
 	default:
 		return false
 	}
+}
+
+func atOrBeforeProfileCursor(cursor domain.SavedStarGiftListCursor, g domain.SavedStarGift) bool {
+	return g.Date > cursor.Date || (g.Date == cursor.Date && g.ID >= cursor.ID)
 }
