@@ -52,7 +52,7 @@ const (
 	accountFrozenMarkDescription       = "The account was frozen"
 )
 
-// tgBotVerification projects domain.BotVerification onto botVerification#f93cd45c.
+// tgBotVerification projects domain.BotVerification onto botVerification#f72e0ed9.
 //
 // The bool reports whether the payload is renderable at all: the icon is a custom
 // emoji document id resolved through messages.getCustomEmojiDocuments, so a zero
@@ -65,12 +65,12 @@ func tgBotVerification(in domain.BotVerification) (tg.BotVerification, bool) {
 	return tg.BotVerification{
 		BotID:       in.BotID,
 		Icon:        in.Icon,
-		Description: in.Description,
+		Description: tg.TextWithEntities{Text: in.Description},
 	}, true
 }
 
 // tgBotVerifierSettings projects domain.BotVerifierSettings onto
-// botVerifierSettings#b0cd6617.
+// botVerifierSettings#a12aefff.
 //
 // custom_description:flags.0 carries the operator default description (the text the
 // verifier applies when it supplies none per peer);
@@ -89,7 +89,7 @@ func tgBotVerifierSettings(in domain.BotVerifierSettings) (tg.BotVerifierSetting
 		out.SetCanModifyCustomDescription(true)
 	}
 	if desc := strings.TrimSpace(in.DefaultDescription); desc != "" {
-		out.SetCustomDescription(desc)
+		out.SetCustomDescription(tg.TextWithEntities{Text: desc})
 	}
 	return out, true
 }

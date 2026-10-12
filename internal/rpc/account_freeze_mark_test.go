@@ -71,7 +71,7 @@ func TestUsersGetFullUserShowsFrozenMarkOnDeletedTombstone(t *testing.T) {
 	}
 	if full.FullUser.BotVerification.BotID != accountFrozenMarkBotID ||
 		full.FullUser.BotVerification.Icon != accountFrozenMarkIcon ||
-		full.FullUser.BotVerification.Description != accountFrozenMarkDescription {
+		full.FullUser.BotVerification.Description.Text != accountFrozenMarkDescription {
 		t.Fatalf("full user bot_verification = %+v, want frozen mark", full.FullUser.BotVerification)
 	}
 
