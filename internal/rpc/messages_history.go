@@ -9,49 +9,6 @@ import (
 	"unicode/utf8"
 )
 
-func (r *Router) onMessagesSearchStickerSets(ctx context.Context, req *tg.MessagesSearchStickerSetsRequest) (tg.MessagesFoundStickerSetsClass, error) {
-	if _, _, err := r.currentUserID(ctx); err != nil {
-		return nil, internalErr()
-	}
-	if utf8.RuneCountInString(req.Q) > maxStickerSearchQLength {
-		return nil, limitInvalidErr()
-	}
-	if req.Hash != 0 {
-		return &tg.MessagesFoundStickerSetsNotModified{}, nil
-	}
-	return &tg.MessagesFoundStickerSets{
-		Hash: 0,
-		Sets: []tg.StickerSetCoveredClass{},
-	}, nil
-}
-
-func (r *Router) onMessagesSearchStickers(ctx context.Context, req *tg.MessagesSearchStickersRequest) (tg.MessagesFoundStickersClass, error) {
-	if _, _, err := r.currentUserID(ctx); err != nil {
-		return nil, internalErr()
-	}
-	if req.Offset < 0 || req.Offset > domain.MaxMessageBoxID || req.Limit < 0 || req.Limit > maxSearchResultsLimit {
-		return nil, limitInvalidErr()
-	}
-	if utf8.RuneCountInString(req.Q) > maxStickerSearchQLength || utf8.RuneCountInString(req.Emoticon) > maxStickerSearchQLength {
-		return nil, limitInvalidErr()
-	}
-	if len(req.LangCode) > maxStickerSearchLangs {
-		return nil, limitInvalidErr()
-	}
-	for _, lang := range req.LangCode {
-		if err := validateEmojiLangCode(lang); err != nil {
-			return nil, err
-		}
-	}
-	if req.Hash != 0 {
-		return &tg.MessagesFoundStickersNotModified{}, nil
-	}
-	return &tg.MessagesFoundStickers{
-		Hash:     0,
-		Stickers: []tg.DocumentClass{},
-	}, nil
-}
-
 func (r *Router) onMessagesGetSearchResultsCalendar(ctx context.Context, req *tg.MessagesGetSearchResultsCalendarRequest) (*tg.MessagesSearchResultsCalendar, error) {
 	if req.OffsetID < 0 || req.OffsetID > domain.MaxMessageBoxID || req.OffsetDate < 0 {
 		return nil, limitInvalidErr()

@@ -477,22 +477,15 @@ func (r *Router) onMessagesGetOldFeaturedStickers(ctx context.Context, req *tg.M
 // 性能：先用集目录 hash 比对，命中即返回 *NotModified——封面文档解析只在 cache-miss
 // 时发生（一次批量 GetDocuments），避免每次请求都解析封面。
 func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind domain.StickerSetKind) (tg.MessagesFeaturedStickersClass, error) {
-	if r.deps.Files == nil {
-		return messagesFeaturedStickersEmpty(hash), nil
-	}
 	// perf：从目录缓存读集（TTL 内 hash 命中不打 PG，封面仅 cache-miss 解析）。
-	sets := r.stickerCatalogSets(ctx, kind)
-	visible := make([]domain.StickerSet, 0, len(sets))
-	for _, s := range sets {
-		if s.ID == 0 || s.Archived {
-			continue
-		}
-		visible = append(visible, s)
+	sets, err := r.loadStickerCatalogSets(ctx, kind)
+	if err != nil {
+		return nil, internalErr()
 	}
+	visible := domain.SearchStickerSets(sets, kind, "")
 	if len(visible) == 0 {
 		return messagesFeaturedStickersEmpty(hash), nil
 	}
-	var err error
 	visible, err = r.stickerSetsWithViewerInstallState(ctx, kind, visible)
 	if err != nil {
 		return nil, err
@@ -502,7 +495,10 @@ func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind d
 		// 关键 perf 短路：目录未变直接返回，不解析任何封面文档。
 		return &tg.MessagesFeaturedStickersNotModified{Count: len(visible)}, nil
 	}
-	covers := r.resolveFeaturedCovers(ctx, visible)
+	covers, err := r.resolveFeaturedCovers(ctx, visible)
+	if err != nil {
+		return nil, internalErr()
+	}
 	covered := make([]tg.StickerSetCoveredClass, 0, len(visible))
 	for _, s := range visible {
 		covered = append(covered, featuredCoveredSet(s, covers))
@@ -516,7 +512,7 @@ func (r *Router) featuredStickersForKind(ctx context.Context, hash int64, kind d
 }
 
 // resolveFeaturedCovers 批量解析所有 featured 集的前若干封面文档（一次查询）。
-func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.StickerSet) map[int64]domain.Document {
+func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.StickerSet) (map[int64]domain.Document, error) {
 	ids := make([]int64, 0, len(sets)*featuredCoversPerSet)
 	for _, s := range sets {
 		for i, id := range s.DocumentIDs {
@@ -529,13 +525,13 @@ func (r *Router) resolveFeaturedCovers(ctx context.Context, sets []domain.Sticke
 		}
 	}
 	if len(ids) == 0 {
-		return nil
+		return nil, nil
 	}
 	docs, err := r.deps.Files.GetDocuments(ctx, ids)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return documentsByID(docs)
+	return documentsByID(docs), nil
 }
 
 // featuredCoveredSet 用已解析的封面构造 covered set；无封面时回退 noCovered。

@@ -750,23 +750,13 @@ func TestTDesktopPassiveChannelStubs(t *testing.T) {
 	if _, err := r.onMessagesGetCustomEmojiDocuments(ownerCtx, make([]int64, maxEmojiDocuments+1)); err == nil || !strings.Contains(err.Error(), "LIMIT_INVALID") {
 		t.Fatalf("messages.getCustomEmojiDocuments too many err = %v, want LIMIT_INVALID", err)
 	}
-	stickerSets, err := r.onMessagesSearchStickerSets(ownerCtx, &tg.MessagesSearchStickerSetsRequest{Q: "cat"})
-	if err != nil {
-		t.Fatalf("messages.searchStickerSets: %v", err)
+	// Sticker search now requires the real catalog dependency and must not
+	// report a successful empty result when this stub-only fixture omits it.
+	if _, err := r.onMessagesSearchStickerSets(ownerCtx, &tg.MessagesSearchStickerSetsRequest{Q: "cat"}); err == nil || !strings.Contains(err.Error(), "INTERNAL_SERVER_ERROR") {
+		t.Fatalf("sticker set search without catalog: %v", err)
 	}
-	if found, ok := stickerSets.(*tg.MessagesFoundStickerSets); !ok || len(found.Sets) != 0 {
-		t.Fatalf("messages.searchStickerSets = %#v, want empty found sets", stickerSets)
-	}
-	stickers, err := r.onMessagesSearchStickers(ownerCtx, &tg.MessagesSearchStickersRequest{
-		Q:        "cat",
-		LangCode: []string{"en"},
-		Limit:    50,
-	})
-	if err != nil {
-		t.Fatalf("messages.searchStickers: %v", err)
-	}
-	if found, ok := stickers.(*tg.MessagesFoundStickers); !ok || len(found.Stickers) != 0 {
-		t.Fatalf("messages.searchStickers = %#v, want empty found stickers", stickers)
+	if _, err := r.onMessagesSearchStickers(ownerCtx, &tg.MessagesSearchStickersRequest{Q: "cat", LangCode: []string{"en"}, Limit: 50}); err == nil || !strings.Contains(err.Error(), "INTERNAL_SERVER_ERROR") {
+		t.Fatalf("sticker search without catalog: %v", err)
 	}
 	if _, err := r.onMessagesSearchStickers(ownerCtx, &tg.MessagesSearchStickersRequest{
 		Limit: maxSearchResultsLimit + 1,

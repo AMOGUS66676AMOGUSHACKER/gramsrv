@@ -822,6 +822,12 @@ func TestSeedMediaFromRealExport(t *testing.T) {
 		t.Fatalf("seed media: %v", err)
 	}
 	t.Logf("seed stats: reactions=%d sets=%d docs=%d blobs=%d", stats.Reactions, stats.StickerSets, stats.Documents, stats.Blobs)
+	for _, doc := range media.docs {
+		id, hash, referenced := doc.StickerSetRef()
+		if set, found := media.sets[id]; referenced && found && hash != set.AccessHash {
+			t.Errorf("document %d does not use published set %d credential", doc.ID, id)
+		}
+	}
 	if stats.Reactions == 0 {
 		t.Error("expected reactions imported")
 	}
