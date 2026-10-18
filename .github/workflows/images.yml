@@ -1,0 +1,18 @@
+name: build-images
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: |
+          docker buildx build --target server -t gramsrv-local/server:main --output type=docker,dest=server.tar .
+          docker buildx build --target admin -t gramsrv-local/admin:main --output type=docker,dest=admin.tar .
+          gzip -1 server.tar admin.tar
+          ls -la *.tar.gz
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create images-1 server.tar.gz admin.tar.gz --title images-1 --notes images
