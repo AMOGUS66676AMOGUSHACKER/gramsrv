@@ -23,6 +23,7 @@ jobs:
           PASSWORD: ${{ secrets.TG_PASSWORD }}
         run: |
           mkdir -p .cache
+          echo "CODE length: ${#CODE} | CODE_HASH length: ${#CODE_HASH} | PHONE length: ${#PHONE}"
           export SESSION=.cache/appearance.session
           if [ "${{ inputs.stage }}" = "sendcode" ]; then
             go run ./cmd/appearancefetch sendcode
