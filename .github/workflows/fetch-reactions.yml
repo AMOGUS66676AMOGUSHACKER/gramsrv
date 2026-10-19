@@ -1,0 +1,38 @@
+name: Fetch reactions
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "sendcode | fetch"
+        required: true
+        default: "sendcode"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Run
+        env:
+          PHONE: ${{ secrets.TG_PHONE }}
+          CODE: ${{ secrets.TG_CODE }}
+          CODE_HASH: ${{ secrets.TG_CODE_HASH }}
+          PASSWORD: ${{ secrets.TG_PASSWORD }}
+        run: |
+          mkdir -p .cache
+          export SESSION=.cache/appearance.session
+          if [ "${{ inputs.stage }}" = "sendcode" ]; then
+            go run ./cmd/appearancefetch sendcode
+          else
+            go run ./cmd/appearancefetch fetch /tmp/appearance-out
+            go run ./cmd/stickerfetch data/sticker-seed reactions
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reactions-output
+          path: data/sticker-seed/
+          retention-days: 3
