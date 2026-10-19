@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	apiID   = 17349
-	apiHash = "344583e45741c457fe1862106095a5eb"
+	apiID   = 24006122
+	apiHash = "47a7d35bb97e410583f341476fe1f7e3"
 )
 
 func sessionPath() string {
